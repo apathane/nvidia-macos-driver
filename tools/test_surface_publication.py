@@ -45,6 +45,7 @@ static int nvmtl_vk_surface_dirty(unsigned s, unsigned p) { return 1; }
 static int nvmtl_noseed(void) { return 0; }
 static void nvmtl_frame_dump(const char *tag, void *base, size_t row, unsigned w, unsigned h) {}
 #define nvlog(...) ((void)0)
+#define NVMTL_SURF_NO_CACHE 0x80000004u
 static int nvmtl_vk_image_write(void *q, Image *i, void *base, size_t row) {
     memcpy(i->gpu,base,4); uploads++; return 0;
 }
@@ -56,13 +57,16 @@ static int nvmtl_vk_image_read(void *q, Image *i, void *base, size_t row) {
 @interface NVMTLTexture : NSObject {
 @public NVMTLTexture *_parent; IOSurfaceRef _surf; BOOL _vramOn, _surfSynced;
     uint32_t _surfSeed, _surfGen; NSUInteger _plane; Image _i; void *_q;
+    uint64_t _reimportTime;
 }
 - (BOOL)nvmtlSurfaceCopyable;
 - (void)nvmtlSurfaceIn;
 - (BOOL)nvmtlSurfaceOut;
+- (BOOL)nvmtlReimportVRAM;
 @end
 @implementation NVMTLTexture
 - (BOOL)nvmtlSurfaceCopyable { return YES; }
+- (BOOL)nvmtlReimportVRAM { return NO; }
 '''
 checks = r'''
 @end

@@ -1858,10 +1858,10 @@ int nvmtl_vk_surface_dirty(uint32_t surfaceID, uint32_t plane)
               on ? "marked newest; a CPU lock / the display pipe pages it off (Apple's page-off)" : "copied out eagerly (old)",
               pnvk_surface_dirty ? "present" : "ABSENT", e ?: "unset");
     }
-    if (!on || !g_dev) return -1;
+    if (!on || !g_dev) return (int)NVMTL_SURF_OFF;
     uint32_t st = pnvk_surface_dirty(g_dev, surfaceID, plane);
     if (st) { static unsigned n; if (n++ < 8 || n % 2000 == 0) nvlog("surface %u dirty refused (%#x) - copy-out (%u so far)", surfaceID, st, n); }
-    return st ? -1 : 0;
+    return (int)st;
 }
 int nvmtl_vk_surface_vram(uint32_t surfaceID, uint32_t plane, size_t need, nvk_buffer *out)
 {

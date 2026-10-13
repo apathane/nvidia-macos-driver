@@ -44,6 +44,7 @@ static inline void *nvmtl_buf_cpu(NVMTLBuffer *b) { nvmtl_buf_settle(b); return 
   uint32_t _viewType, _viewSlices, _relativeLevel, _relativeSlice;
   uint32_t _baseSlice, _baseLevel;
   uint32_t _surfSeed, _surfGen; BOOL _surfSynced, _surfOwned;
+  uint64_t _reimportTime;
   nvk_buffer _vramBuf; BOOL _vramOn;
   BOOL _stex;
   uint64_t _resid;
@@ -55,6 +56,7 @@ static inline void *nvmtl_buf_cpu(NVMTLBuffer *b) { nvmtl_buf_settle(b); return 
 - (void *)nvsampleview;
 - (void)nvmtlSurfaceIn;
 - (BOOL)nvmtlSurfaceOut;
+- (BOOL)nvmtlReimportVRAM;
 @end
 @interface NVMTLFunction : NSObject <MTLFunction> { @public NSData *_spirv; NSString *_fname; NSString *_stage; NSString *_air; NSDictionary *_fc; NSArray *_embedded; unsigned char _bcHash[32]; BOOL _bcHashed;
   NSDictionary *_refl; NSDictionary *_airNames; NSArray *_arguments;

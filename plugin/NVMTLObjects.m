@@ -1227,7 +1227,8 @@ static id nvmtl_surface_sync(NVMTLTexture *t) {
     if (!r->_surf) return YES;
     @synchronized (nvmtl_surface_sync(r)) {
     if (![r nvmtlSurfaceCopyable]) return NO;
-    if (r->_vramOn && !nvmtl_vk_surface_dirty((uint32_t)IOSurfaceGetID(r->_surf), (uint32_t)r->_plane)) {
+    uint32_t ds = r->_vramOn ? (uint32_t)nvmtl_vk_surface_dirty((uint32_t)IOSurfaceGetID(r->_surf), (uint32_t)r->_plane) : 0;
+    if (r->_vramOn && ds == 0) {
         uint32_t seed = IOSurfaceGetSeed(r->_surf);
         r->_surfSeed = seed; r->_surfSynced = YES;
         r->_surfGen = nvmtl_vram_tag_bump(r->_surf, r->_plane, seed);
@@ -1240,6 +1241,20 @@ static id nvmtl_surface_sync(NVMTLTexture *t) {
     void *base = IOSurfaceGetBaseAddressOfPlane(r->_surf, (uint32_t)r->_plane);
     size_t row = IOSurfaceGetBytesPerRowOfPlane(r->_surf, (uint32_t)r->_plane);
     int rc = (base && row) ? nvmtl_vk_image_read(r->_q, &r->_i, base, row) : -1;
+    // Dirty refused with NO_CACHE = the kernel no longer accepts this VRAM binding (re-wired
+    // under BAR1 pressure). The readback above preserved the pixels in system memory; rebind to
+    // the current allocation and push them there so dirtys and flips heal. Rate-limited: at most
+    // one attempt per 2 s per texture; failures keep the old binding (readback path).
+    if (r->_vramOn && ds == NVMTL_SURF_NO_CACHE && !rc && base && row) {
+        uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
+        if (now - r->_reimportTime > 2000000000ull) {
+            r->_reimportTime = now;
+            if ([r nvmtlReimportVRAM]) {
+                int wrc = nvmtl_vk_image_write(r->_q, &r->_i, base, row);
+                if (wrc) nvlog("reimport: surface %u upload into fresh VRAM FAILED", (unsigned)IOSurfaceGetID(r->_surf));
+            }
+        }
+    }
     if (!rc && r->_i.bpp == 4) { char tag[24]; snprintf(tag, sizeof tag, "out%u-", (unsigned)IOSurfaceGetID(r->_surf)); nvmtl_frame_dump(tag, base, row, r->_i.w, r->_i.h); }
     uint32_t seed = 0; IOReturn unlocked = IOSurfaceUnlock(r->_surf, lockopt, &seed); if (lockopt) seed = IOSurfaceGetSeed(r->_surf);
     if (rc || unlocked != kIOReturnSuccess) { nvlog("G13 surface-out: readback FAILED (%ux%u)", r->_i.w, r->_i.h); return NO; }
@@ -1291,6 +1306,41 @@ static id nvmtl_surface_sync(NVMTLTexture *t) {
 - (BOOL)isShareable { return _parent ? NO : _shareable; }
 - (MTLTextureSwizzleChannels)swizzle { return _hasSwz ? _swz : MTLTextureSwizzleChannelsMake(MTLTextureSwizzleRed, MTLTextureSwizzleGreen, MTLTextureSwizzleBlue, MTLTextureSwizzleAlpha); }
 - (BOOL)isSparse { NVMTLTexture *r = _parent ? _parent : self; return (r->_heap && r->_heap->_type == MTLHeapTypeSparse) || (r->_subHeap && r->_subHeap->_type == MTLHeapTypeSparse); }
+// NOTE: this method lives among the accessors on purpose. test_surface_publication.py
+// compiles the span from nvmtl_surface_sync to "- (NSUInteger)width " with a minimal mock;
+// anything inside that span must build against the mock, so surface helpers go here.
+// Rebinds a VRAM-backed surface texture to the allocation the kernel currently has wired.
+// After a BAR1 unwire/re-wire cycle the kernel works on a fresh zeroed allocation with a new
+// cookie while this texture still draws the old one: dirtys come back NO_CACHE, flips go stale,
+// and the panel ping-pongs between the two bindings. Re-importing re-handshakes the kernel
+// cookie (nvAccelSurfVram records it on every successful share) and heals the surface in place.
+// Failure keeps the old binding (readback path), never bricks the texture. Skipped when views
+// exist or the image is heap-placed: the same invariant as heap purge eligibility, whose views
+// would dangle over the destroyed image.
+- (BOOL)nvmtlReimportVRAM {
+    NVMTLTexture *r = _parent ? _parent : self;
+    if (!r->_vramOn || !r->_surf || r->_plane != 0 || IOSurfaceGetPlaneCount(r->_surf) > 1) return NO;
+    if (__atomic_load_n(&r->_nviews, __ATOMIC_ACQUIRE)) return NO;
+    if (r->_ownView || r->_swzView || r->_sampledDepthView || r->_i.placed) return NO;
+    uint32_t w = r->_i.w, h = r->_i.h;
+    extern int nvmtl_pixfmt_public(MTLPixelFormat f, uint32_t *vk, uint32_t *bpp, int *a8);
+    uint32_t vkf = 0, bpp = 0; int a8 = 0;
+    if (!w || !h || nvmtl_pixfmt_public(r->_fmt, &vkf, &bpp, &a8)) return NO;
+    size_t row = IOSurfaceGetBytesPerRow(r->_surf);
+    if (!row || (size_t)w * (bpp ? bpp : 4) > row || h > IOSurfaceGetHeight(r->_surf) || (row % 32)) return NO;
+    nvk_buffer vb; memset(&vb, 0, sizeof vb);
+    if (nvmtl_vk_surface_vram(IOSurfaceGetID(r->_surf), 0, row * h, &vb)) return NO;
+    nvk_image ni; memset(&ni, 0, sizeof ni);
+    int wantStex = (r->_usage & MTLTextureUsageShaderWrite) != 0;
+    if (nvmtl_vk_image_create_buffer_alias(w, h, vkf, bpp, a8, wantStex, 1, &vb, 0, row, &ni)) { nvmtl_vk_buffer_destroy(&vb); return NO; }
+    nvmtl_vk_image_destroy(&r->_i);
+    nvmtl_vk_buffer_destroy(&r->_vramBuf);
+    r->_i = ni; r->_vramBuf = vb;
+    r->_stex = r->_i.storage != 0;
+    static unsigned n; if (++n <= 8 || n % 200 == 0)
+        nvlog("reimport: surface %u rebound to current VRAM (%ux%u, #%u)", (unsigned)IOSurfaceGetID(r->_surf), w, h, n);
+    return YES;
+}
 - (uint32_t)swizzleKey { MTLTextureSwizzleChannels c = [self swizzle]; return (uint32_t)c.red | (uint32_t)c.green << 8 | (uint32_t)c.blue << 16 | (uint32_t)c.alpha << 24; }
 - (BOOL)allowGPUOptimizedContents { return YES; }
 - (MTLTextureCompressionType)compressionType { return MTLTextureCompressionTypeLossless; }

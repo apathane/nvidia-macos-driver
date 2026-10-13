@@ -337,3 +337,9 @@ int nvmtl_vk_cmd_image_gen_mipmaps(nvk_cmdbuf *c, nvk_image *img);
 int nvmtl_vk_surface_share_on(void);
 int nvmtl_vk_surface_vram(uint32_t surfaceID, uint32_t plane, size_t need, nvk_buffer *out);
 int nvmtl_vk_surface_dirty(uint32_t surfaceID, uint32_t plane);
+// Raw NVRM status, not collapsed: 0 = marked newest; NVMTL_SURF_NO_CACHE = the
+// kernel refused this VRAM binding (unwired, or re-wired under BAR1 pressure while
+// userland still draws the old allocation: re-importing heals it); any other code,
+// including-disabled (-1 historically), is transient: keep the old binding.
+#define NVMTL_SURF_NO_CACHE 0x80000004u
+#define NVMTL_SURF_OFF      0x80000002u
