@@ -1712,36 +1712,31 @@ static void nvAccelSurfScanoutSync(IOSurface *s)
     nvFamUnlock(a);
 }
 // True when the surface's system memory holds its newest pixels, after moving them there if the GPU drew them into VRAM.
-// Unlike nvAccelSurfScanoutSync it waits a few ms for the accelerator lock and does not clear the pending mark when the
-// page-off fails. At most 4 frames in a row are held back per head: a surface that never syncs is copied as before
-// rather than freezing the panel.
-static unsigned gIopCopyHeld[kNvMaxFB];
+// Unlike nvAccelSurfScanoutSync it does not clear the pending mark when the page-off fails. gtx1650: try-lock only (no
+// IOSleep on the copy path) and never hold a frame back; a surface that has not synced yet is copied as it is.
 static bool nvAccelSurfCopyReady(IOSurface *s, unsigned head)
 {
     NVAccel *a = NVAccel::gAccel;
     if (!s || !a) return true;
     const unsigned id = _ZNK9IOSurface12getSurfaceIDEv((void *)s);
-    bool ready = !nvSVPend(id, 2);
-    if (!ready) {
-        bool locked = false;
-        for (unsigned i = 0; i < 8 && !(locked = nvFamLock(a, true)); i++) IOSleep(1);
-        if (locked) {
+    if (nvSVPend(id, 2)) {
+        if (nvFamLock(a, true)) {
             void *cache = _ZN22IOGraphicsAccelerator223deviceCacheForIOSurfaceEP9IOSurfacej((void *)a, (void *)s, 0);
             OSObject *ctx = cache ? *(OSObject *volatile *)((unsigned char *)cache + 0x20) : nullptr;
             NVResource *res = OSDynamicCast(NVResource, ctx);
             volatile unsigned short *valid = res ? *(unsigned short *volatile *)((volatile unsigned char *)res + 0x30) : nullptr;
-            if (!res || !valid || (valid[0] & 1u)) ready = true;
-            else { bool out = false; res->pageoff(nullptr, true, &out, 0); ready = out || (valid[0] & 1u); }
-            if (ready) nvSVPend(id, 0);
+            if (!res || !valid || (valid[0] & 1u)) {
+                nvSVPend(id, 0);
+            } else {
+                bool out = false;
+                res->pageoff(nullptr, true, &out, 0);
+                if (out || (valid[0] & 1u)) nvSVPend(id, 0);
+            }
             if (cache) ((OSObject *)cache)->release();
             nvFamUnlock(a);
         }
     }
-    if (head >= kNvMaxFB) return true;
-    if (ready) { gIopCopyHeld[head] = 0; return true; }
-    if (++gIopCopyHeld[head] > 4) { gIopCopyHeld[head] = 0; return true; }
-    OSAddAtomic64(1, &gCntIopCopySkip);
-    return false;
+    return true;
 }
 
 static unsigned nvVaAllocLogged, nvVaMapLogged;
