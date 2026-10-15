@@ -1116,7 +1116,7 @@ NVACCEL_CNT(nvaccel_iop_src_surf,     gCntIopSrcSurf,     "K3: frames sourced fr
 NVACCEL_CNT(nvaccel_iop_blank,        gCntIopBlank,       "K6: frames copied whose 64 samples were all ONE colour (a blank frame)");
 static SInt64 gCntIopCopySkip;
 NVACCEL_CNT(nvaccel_iop_copy_skip,    gCntIopCopySkip,    "frames kept on the panel because the surface's newest pixels were not yet in system memory");
-static int    gIopFlip = 1;
+static int    gIopFlip = 0;   // gtx1650: NVRM auto-go turns this on once BAR1 is placed; -nvrmforceflip forces it on a small BAR1
 static SInt64 gCntIopFlip, gCntIopFlipHome, gCntIopFlipNo[8];
 SYSCTL_INT(_debug, OID_AUTO, nvaccel_iop_flip, CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN, &gIopFlip, 0, "1 = scan the composited IOSurface out of its own VRAM (no copy)");
 NVACCEL_CNT(nvaccel_iop_flips,        gCntIopFlip,        "frames scanned out of the surface's own VRAM (zero copy)");
@@ -1143,8 +1143,9 @@ static bool gSysctlInstalled = false;
 static void nvaccelInstallSysctl(void)
 {
     if (gSysctlInstalled) return;
-    char noFlip[8] = { 0 };
-    if (PE_parse_boot_argn("-nvrmnoflip", noFlip, sizeof noFlip)) gIopFlip = 0;
+    char flipArg[8] = { 0 };
+    if (PE_parse_boot_argn("-nvrmforceflip", flipArg, sizeof flipArg)) gIopFlip = 1;
+    if (PE_parse_boot_argn("-nvrmnoflip", flipArg, sizeof flipArg)) gIopFlip = 0;
 #ifdef NMX_ACCEL
     // only this one: the NVIDIA accelerator may be loaded too, and owns the debug.nvaccel* names
     sysctl_register_oid(&sysctl__debug_nmxaccel_headless);
