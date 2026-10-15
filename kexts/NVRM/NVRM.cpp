@@ -880,6 +880,63 @@ static bool nvrmBusRangeHasOtherDevices(UInt8 first, UInt8 last, IOPCIDevice *se
     return found;
 }
 
+// gtx1650: NvStrapsReBar (terminatorul) without the BIOS mod. A Turing card's Resizable BAR capability offers 64-256 MB
+// only, and the sizes come from the BAR1 size straps in BAR0 (envytools pstraps): 0x101000 bits 15:14 and 0x10100c bits
+// 22:20, bit 31 = override. nvrmstraps=<n> asks for 64 MB << n (6 = 4 GB, NvStrapsReBar's size for a GTX 1650; 7 = 8 GB);
+// the resize below then picks the larger size up. The old straps are put back when the capability does not offer the
+// size afterwards. Straps are not saved across S3 (NvStrapsReBar replays them from the firmware's S3 script).
+static bool gNvrmStrapsAsked;
+static void nvrmTuringStraps(IOPCIDevice *pci, UInt32 cap)
+{
+    UInt32 sel = 0;
+    if (!PE_parse_boot_argn("nvrmstraps", &sel, sizeof sel)) return;
+    if (sel < 3 || sel > 10) { LOG("straps: nvrmstraps=%u out of range 3-10 (512 MB-64 GB) — ignored", sel); return; }
+    gNvrmStrapsAsked = true;
+    const UInt32 bar0 = pci->configRead32(0x10) & ~0xFU;
+    if (!bar0 || !(pci->configRead16(0x04) & 0x2)) { LOG("straps: BAR0 not decoding — skipped"); return; }
+    IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(bar0, 0x102000, kIODirectionInOut);
+    IOMemoryMap *map = md ? md->map(kIOMapInhibitCache) : NULL;
+    if (!map) { LOG("straps: cannot map BAR0 — skipped"); OSSafeReleaseNULL(md); return; }
+    volatile UInt32 *r = (volatile UInt32 *)map->getVirtualAddress();
+    const UInt32 boot0 = r[0];
+    volatile UInt32 *p0 = r + 0x101000 / 4, *p1 = r + 0x10100c / 4;
+    const UInt32 old0 = *p0, old1 = *p1;
+    if (((boot0 >> 24) & 0x1f) != 0x16) {
+        LOG("straps: BOOT_0 0x%08x is not Turing — skipped", boot0);
+    } else {
+        const UInt32 part1 = sel < 10 ? 2 : 3, part2 = sel < 10 ? sel - 2 : 7;
+        const UInt32 new0 = (old0 & ~(3u << 14)) | part1 << 14 | 1u << 31, new1 = (old1 & ~(7u << 20)) | part2 << 20 | 1u << 31;
+        if (new0 != old0) *p0 = new0;
+        if (new1 != old1) *p1 = new1;
+        UInt32 sizes = 0, nbars = (pci->extendedConfigRead32(cap + 8) >> 5) & 7;
+        for (UInt32 i = 0; i < nbars && i < 6; i++)
+            if ((pci->extendedConfigRead32(cap + 8 + i * 8) & 7) == 1) sizes = pci->extendedConfigRead32(cap + 4 + i * 8) >> 4;
+        if ((sizes >> (sel + 6)) & 1) {
+            LOG("straps: BAR1 straps 0x%08x/0x%08x -> 0x%08x/0x%08x, card now offers sizes 0x%x (%u MB asked)", old0, old1, *p0, *p1, sizes, 64u << sel);
+        } else {
+            *p0 = old0; *p1 = old1;
+            LOG("straps: card still offers sizes 0x%x after the strap write (0x%08x/0x%08x) — straps restored", sizes, new0, new1);
+        }
+    }
+    map->release(); md->release();
+}
+
+// gtx1650: Ivy Bridge reaches 36 bits (64 GB) and a Z77 board without Above 4G Decoding has no 64-bit window in _CRS, so
+// both fallbacks above miss. The system agent sends everything between TOUUD and the CPU's top to PCI: take
+// [RAM + 4 GB rounded up to 1 GB, top of the 36-bit space]. Only with nvrmstraps set, and only on Intel below 39 bits.
+static bool nvrmIntel36Window(unsigned physBits, UInt64 *wMin, UInt64 *wMax)
+{
+    if (!gNvrmStrapsAsked || physBits >= 39 || physBits < 36) return false;
+    uint32_t a, b, c, d;
+    __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(0u), "c"(0u));
+    if (!(b == 0x756e6547u && d == 0x49656e69u && c == 0x6c65746eu)) return false;
+    UInt64 memsize = 0; size_t l = sizeof memsize;
+    if (sysctlbyname("hw.memsize", &memsize, &l, NULL, 0) != 0 || !memsize) return false;
+    *wMin = (memsize + (5ULL << 30) - 1) & ~((1ULL << 30) - 1);
+    *wMax = (1ULL << physBits) - 1;
+    return *wMin < *wMax;
+}
+
 bool NVRM::placeLargeBar1()
 {
     static const UInt64 kBigBase = 0x10000000000ULL;
@@ -896,6 +953,7 @@ bool NVRM::placeLargeBar1()
         off = h >> 20;
     }
     if (!cap) { LOG("bar1: no Resizable BAR capability — BAR1 left as IOPCIFamily placed it"); return false; }
+    nvrmTuringStraps(fPCI, cap);
     UInt32 nbars = (fPCI->extendedConfigRead32(cap + 8) >> 5) & 7;
     UInt64 bar1Size = 0;
     UInt32 rbCtlOff = 0, rbCtlOld = 0, rbSupported = 0;
@@ -965,8 +1023,12 @@ bool NVRM::placeLargeBar1()
     if (nvrmHostWindow(fPCI, &wMin, &wMax)) {
         LOG("bar1: host bridge 64-bit window 0x%llx-0x%llx (ACPI _CRS), CPU reaches %u bits", wMin, wMax, physBits);
     } else if (const char *why = nvrmIntel39Window(physBits, ((UInt64)old18 << 32) | (lo14 & ~0xFULL))) {
-        wMin = kBigBase; wMax = kHostWindowEnd;   // the pre-10-07 placement, kept only where the CPU can reach it
-        LOG("bar1: no 64-bit window in the host bridge's _CRS (%s) — using 0x%llx-0x%llx (CPU reaches %u bits)", why, wMin, wMax, physBits);
+        if (nvrmIntel36Window(physBits, &wMin, &wMax)) {
+            LOG("bar1: no 64-bit window in the host bridge's _CRS (%s) — using 0x%llx-0x%llx above RAM (CPU reaches %u bits, nvrmstraps)", why, wMin, wMax, physBits);
+        } else {
+            wMin = kBigBase; wMax = kHostWindowEnd;   // the pre-10-07 placement, kept only where the CPU can reach it
+            LOG("bar1: no 64-bit window in the host bridge's _CRS (%s) — using 0x%llx-0x%llx (CPU reaches %u bits)", why, wMin, wMax, physBits);
+        }
     } else {
         wMin = kIntel39Min; wMax = kIntel39Max;
         LOG("bar1: no 64-bit window in the host bridge's _CRS — using Intel's 256-512 GB PCI range 0x%llx-0x%llx (CPU reaches %u bits)", wMin, wMax, physBits);
