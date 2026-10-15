@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key><string>English</string>
+	<key>CFBundleExecutable</key><string>NVStraps</string>
+	<key>CFBundleIdentifier</key><string>com.apathane.NVStraps</string>
+	<key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+	<key>CFBundleName</key><string>NVStraps</string>
+	<key>CFBundlePackageType</key><string>KEXT</string>
+	<key>CFBundleShortVersionString</key><string>1.0.0</string>
+	<key>CFBundleVersion</key><string>1.0.0</string>
+	<key>IOKitPersonalities</key>
+	<dict>
+		<key>NVStraps</key>
+		<dict>
+			<key>CFBundleIdentifier</key><string>com.apathane.NVStraps</string>
+			<key>IOClass</key><string>NVStraps</string>
+			<key>IOProviderClass</key><string>IOPCIDevice</string>
+			<!-- every Turing ID: TU102 1e00-1e7f, TU104 1e80-1eff, TU106 1f00-1f7f, TU117 1f80-1fff, TU116 2180-21ff -->
+			<key>IOPCIMatch</key><string>0x1e0010de&amp;0xff80ffff 0x1e8010de&amp;0xff80ffff 0x1f0010de&amp;0xff80ffff 0x1f8010de&amp;0xff80ffff 0x218010de&amp;0xff80ffff</string>
+			<key>IOProbeScore</key><integer>200000</integer>
+		</dict>
+	</dict>
+	<key>OSBundleLibraries</key>
+	<dict>
+		<key>com.apple.iokit.IOPCIFamily</key><string>2.9</string>
+		<key>com.apple.kpi.iokit</key><string>19.0</string>
+		<key>com.apple.kpi.libkern</key><string>19.0</string>
+		<key>com.apple.kpi.unsupported</key><string>19.0</string>
+	</dict>
+	<key>OSBundleRequired</key><string>Root</string>
+</dict>
+</plist>
