@@ -55,10 +55,11 @@ typedef struct {
 void nvmtl_vk_clock_refresh(void);
 int nvmtl_vk_interval_seconds(const nvmtl_gpu_interval *t, double *start, double *end);
 
-typedef struct { void *cb; void *fb; void *pool; void *dset[2]; void *depth_view; void *table;
+typedef struct { uintptr_t resource_keys[64]; unsigned resource_key_count;
+                 void *cb; void *fb; void *pool; void *dset[2]; void *depth_view; void *table;
                  void **fbs; unsigned nfb, capfb;
                  nvk_setref *sets; unsigned nsets, capsets;
-                 void *address_pages; unsigned address_count;
+                 void *address_pages; unsigned address_count, address_has_buffers;
                  unsigned nobind, skipped;
                  void *dcache[32]; void *dcachepool; unsigned ndcache;
                  unsigned in_rp, occlusion_reset; uint32_t wseq;
@@ -186,15 +187,22 @@ int  nvmtl_vk_submit_begin_at(nvk_cmdbuf *c, nvmtl_inflight *f, const char *who)
 #define nvmtl_vk_submit_wait(c) nvmtl_vk_submit_wait_at((c), __func__)
 #define nvmtl_vk_submit_begin(c, f) nvmtl_vk_submit_begin_at((c), (f), __func__)
 int  nvmtl_vk_submit_finish(nvmtl_inflight *f);
+// 1 ready, 0 pending, -1 error; never releases resources.
+int nvmtl_vk_submit_ready(nvmtl_inflight *f);
 void nvmtl_vk_gsub_nvk_stats(uint64_t *out, unsigned n);
 int nvmtl_vk_pre_open(void);
 int nvmtl_vk_pre_copy(nvk_buffer *src, size_t srcOff, nvk_buffer *dst, size_t dstOff, size_t size);
 int nvmtl_vk_pre_fill(nvk_buffer *b, size_t offset, size_t size, uint32_t word);
 void nvmtl_vk_pre_hold(void *retained);
-extern void (*nvmtl_pre_release_hook)(void *);
+extern void (*nvmtl_pre_release_hook)(void *, int completed);
+void nvmtl_vk_pre_fail(void);
 extern void (*nvmtl_pre_submit_hook)(void);
 int  nvmtl_vk_image_read(nvk_queue *q, nvk_image *img, void *dst, size_t row_bytes);
 int  nvmtl_vk_image_write(nvk_queue *q, nvk_image *img, const void *src, size_t row_bytes);
+int nvmtl_vk_image_restore_layout(nvk_queue *q, nvk_image *img, uint32_t layout);
+int  nvmtl_vk_image_write_buffer(nvk_queue *q, nvk_image *img, nvk_buffer *src, size_t offset, size_t row_bytes);
+int  nvmtl_vk_image_read_buffer(nvk_queue *q, nvk_image *img, nvk_buffer *dst, size_t offset, size_t row_bytes);
+int  nvmtl_vk_image_read_buffer_encode(nvk_cmdbuf *c, nvk_image *img, nvk_buffer *dst, size_t offset, size_t row_bytes);
 int  nvmtl_vk_copy_buffer(nvk_queue *q, nvk_buffer *src, size_t srcOff, nvk_buffer *dst, size_t dstOff, size_t size);
 int  nvmtl_vk_image_create_mips(uint32_t w, uint32_t h, int bgra, uint32_t mips, nvk_image *out);
 int  nvmtl_vk_image_create_ex(uint32_t w, uint32_t h, uint32_t vkfmt, uint32_t bpp, int a8, uint32_t mips, nvk_image *out);

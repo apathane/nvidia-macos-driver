@@ -117,7 +117,8 @@ static inline const char *nvmtl_icd_lib_path(void) {
 
 static void *g_lib;
 static int g_sample_loader_unwrapped;
-static VkInstance g_inst; static VkPhysicalDevice g_pdev; static VkDevice g_dev; static VkQueue g_queue;
+static VkInstance g_inst; static VkPhysicalDevice g_pdev; static VkDevice g_dev; static VkQueue g_queue, g_copy_queue;
+static VkSemaphore g_resource_timeline[2];
 static int g_host_query_reset, g_occlusion_precise;
 static int g_atomic64_buffer, g_atomic64_shared;
 static int g_coop_matrix, g_float16, g_vulkan_memory_model, g_vulkan_memory_device_scope, g_storage16, g_uniform_storage16;
@@ -202,7 +203,7 @@ void nvmtl_vk_counts(uint64_t *bm, uint64_t *bg, uint64_t *im, uint64_t *ig, siz
     X(vkCreateImageView) X(vkCreateRenderPass) X(vkCreateFramebuffer) X(vkCreateShaderModule) X(vkDestroyShaderModule) X(vkCreatePipelineLayout) X(vkDestroyPipelineLayout) \
     X(vkDestroyPipeline) X(vkDestroyRenderPass) X(vkCreateGraphicsPipelines) X(vkCreateComputePipelines) X(vkCmdDispatch) X(vkCmdPushConstants) X(vkCreateCommandPool) X(vkAllocateCommandBuffers) X(vkBeginCommandBuffer) \
     X(vkCmdBeginRenderPass) X(vkCmdBindPipeline) X(vkCmdDraw) X(vkCmdEndRenderPass) X(vkEndCommandBuffer) \
-    X(vkQueueSubmit) X(vkQueueBindSparse) X(vkCreateFence) X(vkWaitForFences) X(vkResetFences) X(vkDestroyFence) X(vkCmdCopyImageToBuffer) X(vkCmdCopyBufferToImage) X(vkCmdCopyBuffer) \
+    X(vkCreateSemaphore) X(vkDestroySemaphore) X(vkQueueSubmit) X(vkQueueBindSparse) X(vkCreateFence) X(vkWaitForFences) X(vkResetFences) X(vkDestroyFence) X(vkCmdCopyImageToBuffer) X(vkCmdCopyBufferToImage) X(vkCmdCopyBuffer) \
     X(vkCmdPipelineBarrier) X(vkCmdClearColorImage) X(vkCmdClearDepthStencilImage) X(vkDeviceWaitIdle) X(vkFreeCommandBuffers) X(vkCmdSetViewport) X(vkCmdSetScissor) X(vkCmdSetPrimitiveTopology) X(vkCmdSetPrimitiveRestartEnable) X(vkCmdBindVertexBuffers) X(vkCreateDescriptorSetLayout) X(vkCreateDescriptorPool) X(vkAllocateDescriptorSets) X(vkUpdateDescriptorSets) X(vkCmdBindDescriptorSets) X(vkCreateSampler) X(vkDestroySampler) X(vkFreeDescriptorSets) X(vkCmdSetBlendConstants) X(vkCmdSetStencilReference) X(vkCmdSetDepthBias) X(vkCmdFillBuffer) X(vkCmdBindIndexBuffer) X(vkCmdDrawIndexed) X(vkCmdCopyImage) X(vkCmdBlitImage) X(vkGetBufferDeviceAddress) X(vkCmdWriteTimestamp) X(vkCreateQueryPool) X(vkCmdResetQueryPool) X(vkCmdBeginQuery) X(vkCmdEndQuery) X(vkCmdCopyQueryPoolResults) X(vkGetQueryPoolResults) X(vkDestroyQueryPool) X(vkResetQueryPool) X(vkCmdDrawIndirect) X(vkCmdDrawIndexedIndirect) X(vkCmdDispatchIndirect) X(vkCmdSetCullMode) X(vkCmdSetFrontFace) X(vkCmdSetDepthTestEnable) X(vkCmdSetDepthWriteEnable) X(vkCmdSetDepthCompareOp) \
     X(vkDestroyBuffer) X(vkFreeMemory) X(vkDestroyImage) X(vkDestroyImageView) X(vkDestroyFramebuffer) X(vkDestroyCommandPool) \
     X(vkCmdSetStencilTestEnable) X(vkCmdSetStencilOp) X(vkCmdSetStencilCompareMask) X(vkCmdSetStencilWriteMask)
@@ -397,13 +398,20 @@ static VkResult nvmtl_opaque_CreateCommandPool(VkDevice dev, const VkCommandPool
     if (result == VK_SUCCESS) *out = handle;
     return result;
 }
+#include "nvmtl_pipeline_cache.h"
 static VkResult nvmtl_opaque_CreateGraphicsPipelines(VkDevice dev, VkPipelineCache cache, uint32_t count, const VkGraphicsPipelineCreateInfo *info, const VkAllocationCallbacks *allocator, void **out)
 {
     if (count != 1) return VK_ERROR_INITIALIZATION_FAILED;
     VkPipeline handle = VK_NULL_HANDLE;
     VkGraphicsPipelineCreateInfo pinfo;
     if (g_pstat) { pinfo = *info; pinfo.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR; info = &pinfo; }
-    VkResult result = pvkCreateGraphicsPipelines(dev, cache, count, info, allocator, &handle);
+    const int useSharedCache = !cache && g_pipeline_cache;
+    if (useSharedCache) pthread_mutex_lock(&g_pipeline_cache_lock);
+    VkResult result = pvkCreateGraphicsPipelines(dev, useSharedCache ? g_pipeline_cache : cache, count, info, allocator, &handle);
+    if (useSharedCache) {
+        if (result == VK_SUCCESS) nvmtl_pipeline_cache_checkpoint();
+        pthread_mutex_unlock(&g_pipeline_cache_lock);
+    }
     if (result == VK_SUCCESS) *out = handle;
     else if (handle) pvkDestroyPipeline(dev, handle, allocator);
     return result;
@@ -441,7 +449,13 @@ static VkResult nvmtl_opaque_CreateComputePipelines(VkDevice dev, VkPipelineCach
 {
     if (count != 1) return VK_ERROR_INITIALIZATION_FAILED;
     VkPipeline handle = VK_NULL_HANDLE;
-    VkResult result = pvkCreateComputePipelines(dev, cache, count, info, allocator, &handle);
+    const int useSharedCache = !cache && g_pipeline_cache;
+    if (useSharedCache) pthread_mutex_lock(&g_pipeline_cache_lock);
+    VkResult result = pvkCreateComputePipelines(dev, useSharedCache ? g_pipeline_cache : cache, count, info, allocator, &handle);
+    if (useSharedCache) {
+        if (result == VK_SUCCESS) nvmtl_pipeline_cache_checkpoint();
+        pthread_mutex_unlock(&g_pipeline_cache_lock);
+    }
     if (result == VK_SUCCESS) *out = handle;
     else if (handle) pvkDestroyPipeline(dev, handle, allocator);
     return result;
@@ -760,8 +774,10 @@ static int nvmtl_vk_initialize(void)
     if (g_qfam == UINT32_MAX) { nvlog("vk: no graphics+compute queue family"); return -1; }
     g_timestamp_bits = qf[g_qfam].timestampValidBits;
 
-    float prio = 1.0f;
-    VkDeviceQueueCreateInfo qci = { VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, NULL, 0, g_qfam, 1, &prio };
+    float priorities[2] = { 1.0f, 1.0f };
+    const char *single = getenv("NVMTL_SINGLE_QUEUE");
+    uint32_t queue_count = qf[g_qfam].queueCount >= 2 && !(single && single[0] == '1') ? 2 : 1;
+    VkDeviceQueueCreateInfo qci = { VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, NULL, 0, g_qfam, queue_count, priorities };
 
     static const char *kWant[14] = { "VK_EXT_extended_dynamic_state3", "VK_EXT_depth_clip_enable", "VK_EXT_memory_budget",
                                     "VK_KHR_acceleration_structure", "VK_KHR_ray_query", "VK_KHR_deferred_host_operations",
@@ -829,6 +845,7 @@ static int nvmtl_vk_initialize(void)
         q12.pNext = &q11;
         VkPhysicalDeviceFeatures2 f2 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &q12 };
         if (gpf2) gpf2(g_pdev, &f2);
+        v12.timelineSemaphore = q12.timelineSemaphore;
         v12.shaderFloat16 = q12.shaderFloat16;
         v12.shaderInt8 = q12.shaderInt8;
         v12.vulkanMemoryModel = q12.vulkanMemoryModel;
@@ -925,7 +942,13 @@ static int nvmtl_vk_initialize(void)
     nvlog("vk: tessellation %s, vertex-stage stores %s", g_tess ? "AVAILABLE" : "ABSENT", supported.vertexPipelineStoresAndAtomics ? "on" : "off");
     VkDeviceCreateInfo dci = { VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, g_dyn3 ? (const void *)&dyn3 : (const void *)&v11, 0,
                                1, &qci, 0, NULL, next, next ? exts : NULL, &enabled };
-    VKCK(pvkCreateDevice(g_pdev, &dci, NULL, &g_dev), "vkCreateDevice");
+    VkResult device_result = pvkCreateDevice(g_pdev, &dci, NULL, &g_dev);
+    if (device_result != VK_SUCCESS && queue_count > 1 && device_result != VK_ERROR_DEVICE_LOST) {
+        nvlog("vk: two-queue device creation refused (%d); retrying one queue", device_result);
+        queue_count = qci.queueCount = 1;
+        device_result = pvkCreateDevice(g_pdev, &dci, NULL, &g_dev);
+    }
+    VKCK(device_result, "vkCreateDevice");
     DEVICE_FNS(LOAD_D)
     if (g_pstat) { p_pstat_props = (PFN_vkGetPipelineExecutablePropertiesKHR)pvkGetDeviceProcAddr(g_dev, "vkGetPipelineExecutablePropertiesKHR");
                    p_pstat_stats = (PFN_vkGetPipelineExecutableStatisticsKHR)pvkGetDeviceProcAddr(g_dev, "vkGetPipelineExecutableStatisticsKHR");
@@ -1016,6 +1039,18 @@ static int nvmtl_vk_initialize(void)
             g_dsr_depth_modes, g_dsr_stencil_modes, g_dsr_indep, g_dsr_indep_none); }
     nvlog("vk: apps-dyn dynamic vertex strides (vkCmdBindVertexBuffers2): %s", pvkCmdBindVertexBuffers2 ? "yes" : "NO — MTLBufferLayoutStrideDynamic pipelines are refused");
     pvkGetDeviceQueue(g_dev, g_qfam, 0, &g_queue);
+    if (queue_count > 1) pvkGetDeviceQueue(g_dev, g_qfam, 1, &g_copy_queue);
+    nvlog("vk: submission queues: %u (same-family copy handoff %s)", queue_count, g_copy_queue ? "available" : "unavailable; ordered single queue");
+    if (g_copy_queue && v12.timelineSemaphore && pvkCreateSemaphore) {
+        VkSemaphoreTypeCreateInfo type = { VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO, NULL, VK_SEMAPHORE_TYPE_TIMELINE, 0 };
+        VkSemaphoreCreateInfo info = { VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, &type };
+        for (unsigned i = 0; i < 2; i++) if (pvkCreateSemaphore(g_dev, &info, NULL, &g_resource_timeline[i]) != VK_SUCCESS) {
+            for (unsigned j = 0; j < i; j++) pvkDestroySemaphore(g_dev, g_resource_timeline[j], NULL);
+            g_resource_timeline[0] = g_resource_timeline[1] = VK_NULL_HANDLE; break;
+        }
+    }
+    nvlog("resource scheduler: timelines %s; ambiguous accesses remain ordered", g_resource_timeline[0] ? "available" : "unavailable");
+    nvmtl_pipeline_cache_init(&pp);
 
     g_state = 1;
     nvlog("vk: UP in this Metal process — \"%s\" api %u.%u.%u, queue family %u", g_name,
@@ -1148,7 +1183,7 @@ static int bpark_take(size_t size, int host_visible, nvk_buffer *out)
     atomic_fetch_add(&g_bpark_reused, 1); bpark_census("reuse");
     return 0;
 }
-static void bpark_drain_private(void)
+static uint64_t bpark_drain_private(void)
 {
     nvk_buffer out[NVMTL_BUFPARK_N]; unsigned nout = 0;
     pthread_mutex_lock(&g_bpark_lock);
@@ -1158,11 +1193,54 @@ static void bpark_drain_private(void)
         else g_bpark[w++] = g_bpark[k]; }
     g_bpark_n = w;
     pthread_mutex_unlock(&g_bpark_lock);
-    for (unsigned k = 0; k < nout; k++) bpark_free(&out[k]);
-    if (nout) { atomic_fetch_add(&g_bpark_drained, nout);
-        nvlog("buffer park: VRAM wall refused - drained %u parked Private buffers", nout); }
+    uint64_t freed = 0;
+    for (unsigned k = 0; k < nout; k++) { freed += out[k].alloc; bpark_free(&out[k]); }
+    if (nout) { g_budget_stale = 1; atomic_fetch_add(&g_bpark_drained, nout);
+        nvlog("buffer park: pressure reclaimed %llu bytes from %u parked Private buffers",
+              (unsigned long long)freed, nout); }
+    return freed;
 }
 static int nvmtl_vk_buffer_create_body(size_t size, int host_visible, nvk_buffer *out);
+// Recycle only fences whose submissions have completed successfully. Timed-out or
+// uncertain submissions retain their fences and resources in the existing quarantine.
+static pthread_mutex_t nvmtl_fence_mutex = PTHREAD_MUTEX_INITIALIZER;
+static VkFence nvmtl_fence_pool[64];
+static unsigned nvmtl_fence_count;
+static int nvmtl_fence_pool_on(void)
+{
+    const char *e = getenv("NVMTL_NO_FENCE_POOL");
+    return !(e && e[0] == '1');
+}
+static VkResult nvmtl_fence_acquire(VkFence *out)
+{
+    *out = VK_NULL_HANDLE;
+    if (nvmtl_fence_pool_on()) {
+        pthread_mutex_lock(&nvmtl_fence_mutex);
+        if (nvmtl_fence_count) *out = nvmtl_fence_pool[--nvmtl_fence_count];
+        pthread_mutex_unlock(&nvmtl_fence_mutex);
+        if (*out) {
+            VkResult r = pvkResetFences(g_dev, 1, out);
+            if (r == VK_SUCCESS) return r;
+            pvkDestroyFence(g_dev, *out, NULL); *out = VK_NULL_HANDLE;
+            return r;
+        }
+    }
+    VkFenceCreateInfo info = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+    return pvkCreateFence(g_dev, &info, NULL, out);
+}
+static void nvmtl_fence_recycle(VkFence fence)
+{
+    if (nvmtl_fence_pool_on()) {
+        pthread_mutex_lock(&nvmtl_fence_mutex);
+        if (nvmtl_fence_count < sizeof nvmtl_fence_pool / sizeof nvmtl_fence_pool[0]) {
+            nvmtl_fence_pool[nvmtl_fence_count++] = fence;
+            fence = VK_NULL_HANDLE;
+        }
+        pthread_mutex_unlock(&nvmtl_fence_mutex);
+    }
+    if (fence) pvkDestroyFence(g_dev, fence, NULL);
+}
+
 static pthread_mutex_t nvmtl_submit_mutex;
 static uint64_t g_res3_made, g_res3_madesys, g_res3_off, g_res3_on, g_res3_off_b, g_res3_on_b;
 void nvmtl_vk_res3_stats(uint64_t out[6]) { out[0] = g_res3_made; out[1] = g_res3_madesys; out[2] = g_res3_off; out[3] = g_res3_on;
@@ -1300,9 +1378,13 @@ static int nvmtl_vk_buffer_create_body(size_t size, int host_visible, nvk_buffer
         int bgate = nvmtl_vk_vram_wall(mr.size, &bfree, &bbud, &bused, &bmeas);
         VkResult br = bgate ? VK_ERROR_OUT_OF_DEVICE_MEMORY
                             : nvmtl_opaque_AllocateMemory(g_dev, &mai, NULL, &out->mem);
+        // Retry once only after reclaiming idle cache, never on device loss.
+        if (br == VK_ERROR_OUT_OF_DEVICE_MEMORY && bpark_drain_private()) {
+            bgate = nvmtl_vk_vram_wall(mr.size, &bfree, &bbud, &bused, &bmeas);
+            if (!bgate) br = nvmtl_opaque_AllocateMemory(g_dev, &mai, NULL, &out->mem);
+        }
         if (br != VK_SUCCESS) {
             g_buf_vram_refused++;
-            bpark_drain_private();
             nvlog("vk: private buffer of %zu bytes REFUSED VRAM (%s) -> %d: %llu MB free, %llu MB headroom, "
                   "heapUsage %llu of budget %llu MB (%s), %llu buffers live, %llu refused so far "
                   "- the caller places it in system memory",
@@ -1570,6 +1652,9 @@ static int nvmtl_vk_vram_wall(uint64_t want, uint64_t *freev_out, uint64_t *bud_
 {
     uint64_t fv = 0, bd = 0, us = 0; int ms = 0;
     int gate = nvmtl_vk_vram_wall0(want, &fv, &bd, &us, &ms);
+    // Dead cached buffers are cheaper to reclaim than migrating live resources.
+    if (gate && bpark_drain_private())
+        gate = nvmtl_vk_vram_wall0(want, &fv, &bd, &us, &ms);
     if (fv > g_res1_seen_free) { uint64_t up = fv - g_res1_seen_free; g_res1_credit = g_res1_credit > up ? g_res1_credit - up : 0; }
     g_res1_seen_free = fv;
     if (gate && nvmtl_reclaim_hook && !t_in_reclaim) {
@@ -1681,6 +1766,10 @@ static VkResult nvmtl_vk_alloc_image_mem(const VkMemoryRequirements *mr, VkDevic
                (unsigned long long)(freev >> 20), what, (unsigned long long)(mr->size >> 20),
                (unsigned long long)(NVMTL_VRAM_HEADROOM >> 20), (unsigned long long)(used >> 20),
                (unsigned long long)(bud >> 20), measured ? "measured" : "estimated");
+    if (r == VK_ERROR_OUT_OF_DEVICE_MEMORY && bpark_drain_private()) {
+        gate = nvmtl_vk_vram_wall(mr->size, &freev, &bud, &used, &measured);
+        if (!gate) r = pvkAllocateMemory(g_dev, &mai, NULL, mem);
+    }
     if (r == VK_ERROR_OUT_OF_DEVICE_MEMORY && nvmtl_res2_evict_hook && !t_in_reclaim && !nvmtl_res2_evict_off()) {
         t_in_reclaim = 1;
         const uint64_t freed = nvmtl_res2_evict_hook(mr->size | (1ull << 63));
@@ -2579,6 +2668,7 @@ static int nvmtl_address_snapshot(nvk_cmdbuf *c, uint32_t which, VkDescriptorBuf
     nvmtl_bindtable *t = c->table;
     for (unsigned i = 0; i < NVMTL_NBUF; ++i) {
         nvmtl_slot *s = t ? &t->s[which][i] : NULL;
+        if (s && s->kind == NVMTL_SLOT_BUF) c->address_has_buffers = 1;
         addresses[i] = s && s->kind == NVMTL_SLOT_BUF ? s->address + s->off : nvmtl_vk_buffer_address(&g_dummyBuf);
     }
     uint64_t self = nvmtl_vk_buffer_address(&page->buffer);
@@ -5074,9 +5164,10 @@ int nvmtl_vk_cmd_abandon(nvk_cmdbuf *c)
 
 static pthread_mutex_t nvmtl_submit_mutex = PTHREAD_RECURSIVE_MUTEX_INITIALIZER;
 void (*nvmtl_pre_submit_hook)(void);
-void (*nvmtl_pre_release_hook)(void *);
-typedef struct { nvk_cmdbuf cb; unsigned begun, n, fills, copies, nhold; unsigned long long bytes; void *hold[4]; } nvmtl_prologue;
+void (*nvmtl_pre_release_hook)(void *, int completed);
+typedef struct { nvk_cmdbuf cb; unsigned begun, n, fills, copies, nhold, failed; unsigned long long bytes; void *hold[4]; } nvmtl_prologue;
 static __thread nvmtl_prologue *g_pre_cur;
+void nvmtl_vk_pre_fail(void) { if (g_pre_cur) g_pre_cur->failed = 1; }
 static _Atomic unsigned long long g_pre_subs, g_pre_copies, g_pre_fills, g_pre_bytes, g_pre_fail;
 static int nvmtl_prologue_on(void)
 {
@@ -5103,9 +5194,9 @@ int nvmtl_vk_pre_open(void)
 int nvmtl_vk_pre_copy(nvk_buffer *src, size_t srcOff, nvk_buffer *dst, size_t dstOff, size_t size)
 {
     nvmtl_prologue *p = g_pre_cur;
-    if (!p || !p->begun || !src || !dst) return -1;
+    if (!p || !p->begun || !src || !dst) { nvmtl_vk_pre_fail(); return -1; }
     if (!size) return 0;
-    if (srcOff > src->size || size > src->size - srcOff || dstOff > dst->size || size > dst->size - dstOff) return -1;
+    if (srcOff > src->size || size > src->size - srcOff || dstOff > dst->size || size > dst->size - dstOff) { nvmtl_vk_pre_fail(); return -1; }
     if (p->fills && !p->copies) {
         VkMemoryBarrier mb = { VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT };
         pvkCmdPipelineBarrier(p->cb.cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
@@ -5118,9 +5209,9 @@ int nvmtl_vk_pre_copy(nvk_buffer *src, size_t srcOff, nvk_buffer *dst, size_t ds
 int nvmtl_vk_pre_fill(nvk_buffer *b, size_t offset, size_t size, uint32_t word)
 {
     nvmtl_prologue *p = g_pre_cur;
-    if (!p || !p->begun || !b) return -1;
+    if (!p || !p->begun || !b) { nvmtl_vk_pre_fail(); return -1; }
     if (!size) return 0;
-    if ((offset | size) & 3 || offset > b->size || size > b->size - offset) return -1;
+    if ((offset | size) & 3 || offset > b->size || size > b->size - offset) { nvmtl_vk_pre_fail(); return -1; }
     pvkCmdFillBuffer(p->cb.cb, (VkBuffer)b->buf, offset, size, word);
     p->n++; p->fills++; p->bytes += size;
     return 0;
@@ -5130,12 +5221,15 @@ void nvmtl_vk_pre_hold(void *retained)
     nvmtl_prologue *p = g_pre_cur;
     if (p && retained && p->nhold < sizeof p->hold / sizeof p->hold[0]) p->hold[p->nhold++] = retained;
 }
-static void nvmtl_pre_drop(nvmtl_prologue *p)
+static void nvmtl_pre_drop(nvmtl_prologue *p, int completed)
 {
-    for (unsigned i = 0; i < p->nhold; i++) if (p->hold[i] && nvmtl_pre_release_hook) nvmtl_pre_release_hook(p->hold[i]);
+    for (unsigned i = 0; i < p->nhold; i++) if (p->hold[i] && nvmtl_pre_release_hook) nvmtl_pre_release_hook(p->hold[i], completed);
     p->nhold = 0;
 }
-struct nvmtl_inflight { nvk_cmdbuf *c; VkFence fence; nvmtl_prologue pre; uint64_t pt[8]; };
+#include "nvmtl_submission_graph.h"
+#include "nvmtl_resource_schedule.h"
+struct nvmtl_inflight { nvk_cmdbuf *c; VkFence fence; nvmtl_prologue pre; uint64_t pt[8];
+    VkSemaphore handoff[2]; uint64_t graph_id; };
 nvmtl_inflight *nvmtl_vk_inflight_new(void) { return calloc(1, sizeof(nvmtl_inflight)); }
 void nvmtl_vk_inflight_free(nvmtl_inflight *f) { free(f); }
 void nvmtl_vk_gsub_nvk_stats(uint64_t *out, unsigned n)
@@ -5198,8 +5292,8 @@ int nvmtl_vk_submit_begin_at(nvk_cmdbuf *c, nvmtl_inflight *f, const char *who)
     VkResult result = pvkEndCommandBuffer(c->cb);
     const uint64_t sB = nvmtl_perf_now();
     if (result != VK_SUCCESS) { nvmtl_cmd_retire(c); return -1; }
-    VkFenceCreateInfo fci = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO }; VkFence fence;
-    result = pvkCreateFence(g_dev, &fci, NULL, &fence);
+    VkFence fence;
+    result = nvmtl_fence_acquire(&fence);
     const uint64_t sC = nvmtl_perf_now();
     if (result != VK_SUCCESS) { nvmtl_cmd_retire(c); return -1; }
     nvmtl_prologue *const pre = &f->pre;
@@ -5213,17 +5307,28 @@ int nvmtl_vk_submit_begin_at(nvk_cmdbuf *c, nvmtl_inflight *f, const char *who)
     VkCommandBuffer cbs[3]; uint32_t ncb = 0;
     if (counter_reset) cbs[ncb++] = counter_reset;
     if (pre->begun) {
-        VkResult pr = VK_SUCCESS;
-        if (pre->n) {
+        VkResult pr = pre->failed ? VK_ERROR_INITIALIZATION_FAILED : VK_SUCCESS;
+        if (pre->n && !pre->failed) {
             VkMemoryBarrier mb = { VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT };
             pvkCmdPipelineBarrier(pre->cb.cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
             pr = pvkEndCommandBuffer(pre->cb.cb);
         }
-        if (pre->n && pr == VK_SUCCESS) cbs[ncb++] = pre->cb.cb;
-        else {
-            if (pre->n) { g_pre_fail++; nvlog("vk: pre-submit prologue End -> %d - %u uploads/fills (%llu bytes) LOST, the GPU keeps the old bytes", pr, pre->n, pre->bytes); }
-            nvmtl_cmd_retire(&pre->cb); nvmtl_pre_drop(pre); pre->begun = 0;
-        }
+        if (pr != VK_SUCCESS) pre->failed = 1;
+        else if (pre->n) cbs[ncb++] = pre->cb.cb;
+        else { nvmtl_cmd_retire(&pre->cb); nvmtl_pre_drop(pre, 1); pre->begun = 0; }
+    }
+    if (pre->failed) {
+        // No command in this transaction has reached QueueSubmit. Retire the
+        // recordings, restore CPU obligations and fail the dependent draw too.
+        g_pre_fail++;
+        nvlog("vk: prerequisite transfer FAILED; rejecting dependent submission (%u uploads/fills, %llu bytes)", pre->n, pre->bytes);
+        if (pre->begun) nvmtl_cmd_retire(&pre->cb);
+        pre->begun = 0;
+        nvmtl_pre_drop(pre, 0);
+        pthread_mutex_unlock(&nvmtl_submit_mutex);
+        pvkDestroyFence(g_dev, fence, NULL);
+        nvmtl_cmd_retire(c);
+        return -1;
     }
     cbs[ncb++] = c->cb;
     VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO, NULL, 0, NULL, NULL, ncb, cbs, 0, NULL };
@@ -5231,7 +5336,45 @@ int nvmtl_vk_submit_begin_at(nvk_cmdbuf *c, nvmtl_inflight *f, const char *who)
     nvmtl_wit_control(wseq);
     const uint64_t sE = nvmtl_perf_now();
     if (pt[0]) { pt[1] = pt[0] + (sA - pt[0]) + (sD - sC); pt[2] = pt[1] + (sB - sA) + (sE - sD); pt[3] = pt[2] + (sC - sB); }
-    result = g_state == 1 ? pvkQueueSubmit(g_queue, 1, &si, fence) : VK_ERROR_DEVICE_LOST;
+    // Same-family queues share resource ownership. The gate preserves every
+    // earlier graphics dependency; no inferred resource independence is assumed.
+    // The handoff is serialized by its gate: splitting does not overlap uploads
+    // with draws. Batch by default to avoid two submits and semaphore churn.
+    const char *copy_split = getenv("NVMTL_SPLIT_UPLOAD_QUEUE");
+    int split = copy_split && copy_split[0] == '1' && g_copy_queue && pre->begun && pre->n &&
+        pvkCreateSemaphore && pvkDestroySemaphore;
+    if (split) {
+        VkSemaphoreCreateInfo sci = { VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
+        for (unsigned i = 0; i < 2; i++) {
+            if (pvkCreateSemaphore(g_dev, &sci, NULL, &f->handoff[i]) != VK_SUCCESS) { split = 0; break; }
+        }
+        if (!split) for (unsigned i = 0; i < 2; i++) if (f->handoff[i]) {
+            pvkDestroySemaphore(g_dev, f->handoff[i], NULL); f->handoff[i] = VK_NULL_HANDLE;
+        }
+    }
+    unsigned lane = 0;
+    VkResult dependencies = nvmtl_resource_lane(c, pre->begun && pre->n, &lane);
+    f->graph_id = nvmtl_graph_begin(lane ? 2 : split, pre->bytes);
+    if (dependencies != VK_SUCCESS) {
+        result = dependencies;
+    } else if (split && g_state == 1) {
+        VkPipelineStageFlags stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+        VkSubmitInfo gate = { VK_STRUCTURE_TYPE_SUBMIT_INFO, NULL, 0, NULL, NULL,
+            counter_reset ? 1u : 0u, counter_reset ? &counter_reset : NULL, 1, &f->handoff[0] };
+        VkSubmitInfo upload = { VK_STRUCTURE_TYPE_SUBMIT_INFO, NULL, 1, &f->handoff[0], &stage,
+            1, &pre->cb.cb, 1, &f->handoff[1] };
+        VkSubmitInfo draw = { VK_STRUCTURE_TYPE_SUBMIT_INFO, NULL, 1, &f->handoff[1], &stage,
+            1, &c->cb, 0, NULL };
+        result = nvmtl_resource_submit(g_queue, &gate, VK_NULL_HANDLE, 0, 0);
+        nvmtl_graph_event(f->graph_id, "gate", result);
+        if (result == VK_SUCCESS) {
+            result = pvkQueueSubmit(g_copy_queue, 1, &upload, VK_NULL_HANDLE);
+            nvmtl_graph_event(f->graph_id, "upload", result);
+        }
+        if (result == VK_SUCCESS) result = nvmtl_resource_submit(g_queue, &draw, fence, 0, 1);
+    } else result = g_state == 1 ? nvmtl_resource_submit(lane ? g_copy_queue : g_queue, &si, fence, lane, 1) : VK_ERROR_DEVICE_LOST;
+    if (result == VK_SUCCESS) nvmtl_resource_register(c, fence, lane, pre->begun && pre->n);
+    nvmtl_graph_event(f->graph_id, "submit", result);
     pthread_mutex_unlock(&nvmtl_submit_mutex);
     pt[4] = nvmtl_perf_now();
     g_cmd_submitted++;
@@ -5242,6 +5385,12 @@ int nvmtl_vk_submit_begin_at(nvk_cmdbuf *c, nvmtl_inflight *f, const char *who)
     }
     f->fence = fence;
     return 0;
+}
+int nvmtl_vk_submit_ready(nvmtl_inflight *f)
+{
+    if (!f || !f->fence || g_state != 1) return -1;
+    VkResult result = pvkWaitForFences(g_dev, 1, &f->fence, VK_TRUE, 0);
+    return result == VK_SUCCESS ? 1 : result == VK_TIMEOUT ? 0 : -1;
 }
 int nvmtl_vk_submit_finish(nvmtl_inflight *f)
 {
@@ -5267,12 +5416,14 @@ int nvmtl_vk_submit_finish(nvmtl_inflight *f)
     if (wr != VK_SUCCESS || g_state != 1) {
         g_state = -1;
         nvlog("vk: fence wait -> %d after %ld ms (budget %ld ms); disabling backend without retiring in-flight resources", wr, waited_ms, budget_ms);
+        nvmtl_graph_event(f->graph_id, "wait_failed", wr == VK_SUCCESS ? VK_ERROR_DEVICE_LOST : wr);
         return -2;
     }
     if (c->wseq && c->wseq != NVMTL_WSEQ_BLIND) {
         if (nvmtl_keep_verdict(c->wseq) < 0) {
             g_state = -1;
             nvlog("vk: completion witness missing; disabling backend and retaining all in-flight resources");
+            nvmtl_graph_event(f->graph_id, "witness_failed", VK_ERROR_DEVICE_LOST);
             return -2;
         }
         c->wseq = 0;
@@ -5304,14 +5455,19 @@ int nvmtl_vk_submit_finish(nvmtl_inflight *f)
         }
         pvkDestroyQueryPool(g_dev, (VkQueryPool)c->pt_pool, NULL); c->pt_pool = NULL; c->pt_n = 0;
     }
-    pvkDestroyFence(g_dev, fence, NULL);
+    nvmtl_graph_event(f->graph_id, "complete", VK_SUCCESS);
+    for (unsigned i = 0; i < 2; i++) if (f->handoff[i]) {
+        pvkDestroySemaphore(g_dev, f->handoff[i], NULL); f->handoff[i] = VK_NULL_HANDLE;
+    }
+    nvmtl_resource_forget(fence);
+    nvmtl_fence_recycle(fence);
     if (c->nsets > g_peak_sets) { g_peak_sets = c->nsets; nvlog("vk: commit high-water: %u descriptor sets = %u draws in one command buffer (%u pools open)", c->nsets, c->nsets / 2, g_ndescPools); }
     if (c->nfb > g_peak_fbs) g_peak_fbs = c->nfb;
     if (c->skipped) nvlog("vk: commit with %u draws/dispatches SKIPPED (no descriptor set could be allocated)", c->skipped);
     const unsigned perf_sets = c->nsets;
     pt[6] = nvmtl_perf_now();
     if (pre->begun) {
-        pre->cb.wseq = c->wseq; nvmtl_cmd_retire(&pre->cb); nvmtl_pre_drop(pre);
+        pre->cb.wseq = c->wseq; nvmtl_cmd_retire(&pre->cb); nvmtl_pre_drop(pre, 1);
         const unsigned long long k = g_pre_subs++; g_pre_copies += pre->copies; g_pre_fills += pre->fills; g_pre_bytes += pre->bytes;
         if (!k || ((k + 1) & 0xFFF) == 0)
             nvlog("vk: pre-submit prologue census: %llu submits carried %llu managed uploads + %llu zero fills (%llu KB) - each WAS its own submit; %llu prologues failed",
@@ -5723,6 +5879,71 @@ int nvmtl_vk_image_read(nvk_queue *q, nvk_image *img, void *dst, size_t row_byte
     return 0;
 }
 
+// SURFDMA-r1: the GPU copies straight between an IOSurface's own pages (imported with VK_EXT_external_memory_host,
+// RM OS descriptor, COHERENCY_CACHED = snooped) and the image, so surface-in/out need no CPU memcpy through a staging
+// buffer. Only for single-block 32/64/128-bit colour formats whose rows are whole texels; anything else keeps the
+// staging path. `src`/`dst` cover the surface allocation, `offset` is the plane's byte offset in it.
+static int nvmtl_surfdma_shape_ok(const nvk_image *img, size_t offset, size_t row_bytes)
+{
+    const size_t bpp = img->bpp ? img->bpp : 4;
+    if (img->bw > 1 || img->bh > 1) return 0;
+    if (nvmtl_barrier_aspect(img) != VK_IMAGE_ASPECT_COLOR_BIT) return 0;
+    if (bpp < 4 || (row_bytes % bpp) || (offset % bpp) || (offset & 3)) return 0;
+    if (row_bytes / bpp < img->w) return 0;
+    return 1;
+}
+int nvmtl_vk_image_write_buffer(nvk_queue *q, nvk_image *img, nvk_buffer *src, size_t offset, size_t row_bytes)
+{
+    const size_t bpp = img->bpp ? img->bpp : 4;
+    if (!src || !src->buf || !nvmtl_surfdma_shape_ok(img, offset, row_bytes)) return -1;
+    if (offset + row_bytes * (size_t)(img->h - 1) + (size_t)img->w * bpp > src->size) return -1;
+    nvk_cmdbuf c; if (nvmtl_vk_cmd_begin(q, &c)) return -1;
+    VkImageSubresourceRange range = { nvmtl_barrier_aspect(img), 0, 1, 0, 1 };
+    VkImageMemoryBarrier toDst = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL, 0, VK_ACCESS_TRANSFER_WRITE_BIT,
+        VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, (VkImage)img->img, range };
+    pvkCmdPipelineBarrier(c.cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &toDst);
+    VkBufferImageCopy bic = { offset, (uint32_t)(row_bytes / bpp), 0, { nvmtl_copy_aspect(img), 0, 0, 1 }, { 0, 0, 0 }, { img->w, img->h, 1 } };
+    pvkCmdCopyBufferToImage(c.cb, (VkBuffer)src->buf, (VkImage)img->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bic);
+    VkImageMemoryBarrier toRead = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL,
+        VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, (VkImage)img->img, range };
+    pvkCmdPipelineBarrier(c.cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, &toRead);
+    img->layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    return nvmtl_vk_submit_wait_at(&c, "surface upload (dma)");
+}
+int nvmtl_vk_image_read_buffer_encode(nvk_cmdbuf *c, nvk_image *img, nvk_buffer *dst, size_t offset, size_t row_bytes)
+{
+    const size_t bpp = img->bpp ? img->bpp : 4;
+    if (!dst || !dst->buf || !nvmtl_surfdma_shape_ok(img, offset, row_bytes)) return -1;
+    if (offset + row_bytes * (size_t)(img->h - 1) + (size_t)img->w * bpp > dst->size) return -1;
+    if (!c || !c->cb) return -1;
+    VkImageSubresourceRange range = { nvmtl_barrier_aspect(img), 0, 1, 0, 1 };
+    VkImageMemoryBarrier toSrc = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL,
+        VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+        (VkImageLayout)img->layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, (VkImage)img->img, range };
+    pvkCmdPipelineBarrier(c->cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &toSrc);
+    img->layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    VkBufferImageCopy bic = { offset, (uint32_t)(row_bytes / bpp), 0, { nvmtl_copy_aspect(img), 0, 0, 1 }, { 0, 0, 0 }, { img->w, img->h, 1 } };
+    pvkCmdCopyImageToBuffer(c->cb, img->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst->buf, 1, &bic);
+    // The CPU (this process, the compositor, NVAccel's scanout copy) reads these pages next.
+    VkMemoryBarrier toHost = { VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT };
+    pvkCmdPipelineBarrier(c->cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &toHost, 0, NULL, 0, NULL);
+    return 0;
+}
+
+int nvmtl_vk_image_read_buffer(nvk_queue *q, nvk_image *img, nvk_buffer *dst, size_t offset, size_t row_bytes)
+{
+    nvk_cmdbuf c;
+    if (nvmtl_vk_cmd_begin(q, &c)) return -1;
+    if (nvmtl_vk_image_read_buffer_encode(&c, img, dst, offset, row_bytes)) {
+        nvmtl_vk_cmd_abandon(&c); return -1;
+    }
+    return nvmtl_vk_submit_wait_at(&c, "surface readback (dma)");
+}
+
 static void img_to(nvk_cmdbuf *c, nvk_image *img, VkImageLayout to,
                    VkAccessFlags srcA, VkAccessFlags dstA, VkPipelineStageFlags srcS, VkPipelineStageFlags dstS)
 {
@@ -5740,6 +5961,19 @@ static void img_to(nvk_cmdbuf *c, nvk_image *img, VkImageLayout to,
     }
     pvkCmdPipelineBarrier(c->cb, srcS, dstS, 0, 0, NULL, 0, NULL, 1, &b);
     img->layout = to;
+}
+
+// Restore the layout expected by an already recorded consumer after refreshing
+// its CPU-backed surface. The caller restores the CPU-side recording state.
+int nvmtl_vk_image_restore_layout(nvk_queue *q, nvk_image *img, uint32_t layout)
+{
+    if (img->layout == layout) return 0;
+    if (layout == VK_IMAGE_LAYOUT_UNDEFINED || layout == VK_IMAGE_LAYOUT_PREINITIALIZED) return -1;
+    nvk_cmdbuf c; if (nvmtl_vk_cmd_begin(q, &c)) return -1;
+    img_to(&c, img, (VkImageLayout)layout, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+           VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+           VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+    return nvmtl_vk_submit_wait_at(&c, "surface refresh layout");
 }
 
 static void nvmtl_private_depth_layout(nvk_cmdbuf *c, nvk_image *img, VkImageLayout to)

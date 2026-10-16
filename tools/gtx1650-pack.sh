@@ -1,7 +1,7 @@
 #!/bin/bash
 # gtx1650: repack the official release with this branch's binaries, so install.sh, uninstall.sh and the 1401 app keep
 # working. Usage:
-#   tools/gtx1650-pack.sh nullmoth-nvidia-2.0.2.tar.gz NVRM=<bin> [NVAccel=<bin>] [NVRMFB=<bin>] [NVMTLDriver=<bin>]
+#   tools/gtx1650-pack.sh nullmoth-nvidia-2.0.4.tar.gz [NVAccel=<bin>] [NVAccel26=<bin>] [NVRMFB=<bin>] [NVMTLDriver=<bin>]
 # Each <bin> is a built Mach-O (the file that goes in Contents/MacOS). Writes nullmoth-nvidia-2.0.2-gtx1650.tar.gz;
 # install it with: tar -xzf nullmoth-nvidia-2.0.2-gtx1650.tar.gz && cd pkgroot && sudo ./install.sh
 set -euo pipefail
@@ -18,6 +18,7 @@ for arg in "$@"; do
     NVAccel) dst=("$P/Library/NullMoth/kexts/15/NVAccel.kext/Contents/MacOS/NVAccel")
              [ -f "$P/Library/Extensions/NVAccel.kext/Contents/MacOS/NVAccel" ] && dst+=("$P/Library/Extensions/NVAccel.kext/Contents/MacOS/NVAccel") ;;
     NVMTLDriver) dst=("$P/Library/GPUBundles/NVMTLDriver.bundle/Contents/MacOS/NVMTLDriver") ;;
+    NVAccel26) dst=("$P/Library/NullMoth/kexts/26/NVAccel.kext/Contents/MacOS/NVAccel") ;;
     *) echo "unknown component $name"; exit 2 ;;
   esac
   for d in "${dst[@]}"; do [ -f "$d" ] || { echo "$d not in the package"; exit 2; }; cp "$bin" "$d"; echo "replaced ${d#$T/}"; done

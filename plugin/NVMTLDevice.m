@@ -739,7 +739,7 @@ static int nvmtl_surface_image_create(NVMTLTexture *t, IOSurfaceRef surf, NSUInt
                     t->_vramBuf = vb; t->_vramOn = YES; g_surf_vram++;
                     uint32_t seed = IOSurfaceGetSeed(surf);
                     int current = nvmtl_vram_tag_current(surf, 0, seed);
-                    if (current) { t->_surfSeed = seed; t->_surfSynced = YES; }
+                    if (current) { t->_coherence->surfaceSeed = seed; t->_coherence->surfaceSynced = YES; }
                     static unsigned n; if (n++ < 8 || n % 2000 == 0)
                         nvlog("item 7: surface %u %ux%u pitch %zu -> the family's VRAM%s (vram %llu, private %llu)", (unsigned)IOSurfaceGetID(surf),
                               w, h, row, current ? ", already current (no upload)" : "", g_surf_vram, g_surf_private);
@@ -1573,6 +1573,7 @@ static void nvmtl_log_compute_descriptor(MTLComputePipelineDescriptor *d) {
     if (nvmtl_vk_init()) return nil;
     NVMTLSamplerState *s = [NVMTLSamplerState new];
     s->_label = [sd.label copy];
+    s->_descriptor = [sd copy];
     if (!sd.normalizedCoordinates) {
         NSArray *addresses=@[@"ClampToEdge",@"MirrorClampToEdge",@"Repeat",@"MirroredRepeat",@"ClampToZero",@"ClampToBorder"];
         NSArray *compare=@[@"None",@"Less",@"Equal",@"LessEqual",@"Greater",@"NotEqual",@"GreaterEqual",@"Always"];
@@ -1590,7 +1591,7 @@ static void nvmtl_log_compute_descriptor(MTLComputePipelineDescriptor *d) {
     int linear = (sd.minFilter == MTLSamplerMinMagFilterLinear || sd.magFilter == MTLSamplerMinMagFilterLinear);
     int repeat = (sd.sAddressMode == MTLSamplerAddressModeRepeat);
     int failed;
-    if (sd.normalizedCoordinates && !getenv("NVMTL_NO_SAMPLER_CONTRACT")) {
+    if (sd.normalizedCoordinates) {
         if ((NSUInteger)sd.minFilter > 1 || (NSUInteger)sd.magFilter > 1 || (NSUInteger)sd.mipFilter > 2 ||
             (NSUInteger)sd.sAddressMode > 5 || (NSUInteger)sd.tAddressMode > 5 || (NSUInteger)sd.rAddressMode > 5 ||
             (NSUInteger)sd.compareFunction > 7 || (NSUInteger)sd.borderColor > 2 || sd.maxAnisotropy < 1 || sd.maxAnisotropy > 16) return nil;

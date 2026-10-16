@@ -4,13 +4,15 @@
  * SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
  */
 
+#import "NVMTLPixelReplay.m"
+
 @interface NVMTLQueueReservation : NSObject { @public __weak NVMTLCommandBuffer *buffer; } @end
 @implementation NVMTLQueueReservation @end
 @interface NVMTLSubmissionPart : NSObject {
 @public
     nvk_cmdbuf commands;
     NSSet *resources, *surfaces;
-    NSArray *scratch;
+    NSArray *scratch, *surfaceInputs;
     id waitEvent, signalEvent;
     uint64_t value;
     unsigned encoders;
@@ -19,8 +21,9 @@
     int aheadFailed;
     BOOL waitFolded;
     BOOL aheadEmpty;
-    NSArray<NVMTLBuffer *> *copyInputs;
-    BOOL copyInputsPrepared, hasHostCopies;
+    BOOL needsHostPublication;
+    NSArray *syncBuffers;
+    NSMapTable *hostBaselines;
 }
 @end
 static _Atomic unsigned gsub_inflight;
@@ -109,6 +112,15 @@ static BOOL nvmtl_async_commit_on(void) {
         nvlog("commit: %s (NVMTL_ASYNC_COMMIT=%s)", on ? "ASYNC (default) - execution worker, submit ahead, queue capacity enforced" : "synchronous (NVMTL_ASYNC_COMMIT=0)", e ? e : "unset"); }
     return on;
 }
+static BOOL nvmtl_deferred_completion_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("NVMTL_DEFER_HOST_COMPLETION");
+        on = !(e && e[0] == '0');
+        nvlog("commit: deferred host-segment completion %s", on ? "ON" : "OFF");
+    }
+    return on;
+}
 static _Atomic unsigned long long gSkipEmpty;
 static int nvmtl_skip_empty_on(void) {
     static int on = -1;
@@ -135,11 +147,57 @@ static int nvmtl_skip_empty_on(void) {
     NVMTLSubmissionPart *part = [NVMTLSubmissionPart new];
     part->commands = _c;
     memset(&_c, 0, sizeof(_c));
+    // A texture can reference a copied no-copy buffer without the app ever
+    // binding that buffer directly. Include its backing in submission-time
+    // synchronization, including texture views and render attachments.
+    NSMutableSet *syncBuffers = [NSMutableSet new];
+    for (id resource in [_resources copy]) {
+        NVMTLBuffer *backing = nil;
+        if ([resource isKindOfClass:[NVMTLBuffer class]]) backing = resource;
+        else if ([resource isKindOfClass:[NVMTLTexture class]]) backing = (NVMTLBuffer *)[(NVMTLTexture *)resource buffer];
+        if (backing && (backing->_hostPtr || backing->_shadow.map)) {
+            [_resources addObject:backing];
+            [syncBuffers addObject:backing];
+            if (backing->_hostPtr) {
+                _hostSyncRequired = YES;
+                part->needsHostPublication = YES;
+            }
+        }
+    }
     part->resources = [(NVMTLResSet *)_resources nvmtlTakeAll]; part->surfaces = [_surfDirty copy];
     // Another process may read an IOSurface once its writer is scheduled, and nothing orders its queue after ours.
     static int after = -1; if (after < 0) { const char *e = getenv("NVMTL_SCHEDULE_AFTER_SURFACE_WRITES"); after = e && e[0] == '1'; }
     NVMTLTexture *drawable = _present ? (_present->_parent ?: _present) : nil;
     for (NVMTLTexture *s in part->surfaces) if (after && s != drawable) _scheduleAfterPublish = YES;
+    part->surfaceInputs = [_surfaceInputs.allValues copy]; [_surfaceInputs removeAllObjects];
+    part->syncBuffers = syncBuffers.allObjects;
+    if (part->surfaceInputs.count) part->needsHostPublication = YES;
+    // Conservative exclusive access keys. Unknown/indirect resources retain
+    // the global ordering path; aliases use backing memory, never view identity.
+    nvk_cmdbuf *haz = &part->commands;
+    BOOL tracked = !event && !_g79Sig.count && !part->needsHostPublication && !_hostSyncRequired &&
+        !part->commands.address_has_buffers && !part->commands.counter_recording;
+    haz->resource_keys[0] = (uintptr_t)(__bridge void *)_queue;
+    haz->resource_key_count = 1;
+    for (id resource in part->resources) {
+        uintptr_t key = 0;
+        if ([resource isKindOfClass:[NVMTLTexture class]]) {
+            NVMTLTexture *t = resource;
+            while (t->_parent || t->_viewParent) t = t->_parent ?: t->_viewParent;
+            if (t->_surf || t->_heap || t->_subHeap || t->_backBuf || t->_aliased ||
+                t->_i.placed || t->_i.vpair || !t->_i.mem) { tracked = NO; break; }
+            key = (uintptr_t)t->_i.mem;
+        } else if ([resource isKindOfClass:[NVMTLSamplerState class]]) continue;
+        else if ([resource isKindOfClass:[NVMTLRenderPipelineState class]]) {
+            NVMTLRenderPipelineState *p = resource;
+            if (p->_descriptor.supportIndirectCommandBuffers) { tracked = NO; break; }
+            continue;
+        } else if ([resource isKindOfClass:[NVMTLComputePipelineState class]]) continue;
+        else { tracked = NO; break; } // buffers may contain indirect GPU addresses
+        if (haz->resource_key_count == 64) { tracked = NO; break; }
+        haz->resource_keys[haz->resource_key_count++] = key;
+    }
+    if (!tracked || haz->resource_key_count < 2) haz->resource_key_count = 0;
     part->scratch = [_scratch copy]; part->signalEvent = event; part->value = value;
     part->encoders = _nEnc - _nEncSealed; _nEncSealed = _nEnc;
     if (_g79Sig.count) { part->signals = [_g79Sig copy]; [_g79Sig removeAllObjects]; }
@@ -179,6 +237,7 @@ static int nvmtl_skip_empty_on(void) {
     [self nvmtlSealPartWithSignal:nil value:0 restart:YES];
     NVMTLSubmissionPart *part = [NVMTLSubmissionPart new];
     part->waitEvent = event; part->value = value; [_parts addObject:part];
+    _surfaceWaitSeen = YES;
 }
 - (void)nvmtlRecordSignal:(id)event value:(uint64_t)value {
     if (!event || _committed) return;
@@ -325,36 +384,6 @@ static void nvmtl_gsub_census(void) {
           (unsigned long long)s[1], (unsigned long long)s[2], (unsigned long long)s[3], (unsigned long long)s[4],
           (unsigned long long)s[5], (unsigned long long)s[6], (unsigned long long)s[7], (unsigned long long)s[8]);
 }
-// A texture over a copy-backed buffer must refresh the same bytes as a direct
-// buffer binding. Keep direct managed-buffer writeback and copy each backing once.
-static NSArray<NVMTLBuffer *> *nvmtl_submission_copies(NSSet *resources, BOOL writtenOnly) {
-    NSMutableSet<NVMTLBuffer *> *copies = nil;
-    for (id resource in resources) {
-        NVMTLBuffer *buffer = nil;
-        if ([resource isKindOfClass:[NVMTLBuffer class]]) buffer = resource;
-        else if ([resource isKindOfClass:[NVMTLTexture class]]) {
-            NVMTLTexture *texture = resource;
-            if (writtenOnly && texture->_usage != MTLTextureUsageUnknown &&
-                !(texture->_usage & (MTLTextureUsageShaderWrite | MTLTextureUsageRenderTarget))) continue;
-            buffer = texture->_backBuf ?: (texture->_parent ? texture->_parent->_backBuf : nil);
-        }
-        if (!buffer || (!buffer->_hostPtr && !buffer->_shadow.map)) continue;
-        if (!copies) copies = [NSMutableSet new];
-        [copies addObject:buffer];
-    }
-    return copies.allObjects;
-}
-static void nvmtl_prepare_submission_copies(NVMTLSubmissionPart *part) {
-    if (part->copyInputsPrepared) return;
-    // A sealed part's membership and its buffers' backing modes do not change.
-    // The ahead pass can retry a held part many times: discover its upload
-    // backings once, but refresh their bytes only when it actually submits.
-    part->copyInputs = nvmtl_submission_copies(part->resources, NO);
-    for (NVMTLBuffer *buffer in part->copyInputs) {
-        if (buffer->_hostPtr) { part->hasHostCopies = YES; break; }
-    }
-    part->copyInputsPrepared = YES;
-}
 - (BOOL)nvmtlSubmitAhead {
     if (_executionDone || _cbError || !_committed) return NO;
     if (_nextSubmit < _nextPart) _nextSubmit = _nextPart;
@@ -362,7 +391,12 @@ static void nvmtl_prepare_submission_copies(NVMTLSubmissionPart *part) {
         if (atomic_load(&gsub_inflight) >= nvmtl_gsub_cap()) return NO;
         NVMTLSubmissionPart *part = _parts[_nextSubmit];
         if (![part isKindOfClass:[NVMTLSubmissionPart class]]) return NO;
+        if (part->inflight || part->aheadFailed) return NO;
+        // GPU-only prefixes may run ahead. A copied-host segment still waits
+        // for CPU publication, including any preceding event dependency.
+        if (part->needsHostPublication) return NO;
         if (part->waitEvent) {
+            if (_hostSyncRequired) return NO;
             if (!nvmtl_evfold_on() || nvmtl_evfold_promised(part->waitEvent) < part->value) return NO;
             part->waitFolded = YES; _nextSubmit++; nvmtl_evfold_census(&gEvFold, "event waits ordered by the channel (no CPU hold)");
             continue;
@@ -378,17 +412,13 @@ static void nvmtl_prepare_submission_copies(NVMTLSubmissionPart *part) {
             nvmtl_evfold_census(&gEvFoldEmpty, "empty split parts retired by the ahead pass");
             continue;
         }
-        nvmtl_prepare_submission_copies(part);
-        {
-            static int hold = -1;
-            if (hold < 0) { const char *e = getenv("NVMTL_GSUB_HOSTPTR_LIFT"); hold = (e && *e && *e != '0') ? 0 : 1; }
-            if (hold && part->hasHostCopies) return NO;
-        }
         nvmtl_inflight *f = nvmtl_vk_inflight_new();
         if (!f) return NO;
-        for (NVMTLBuffer *buffer in part->copyInputs) nvmtl_buffer_sync_in(buffer);
+        for (NVMTLBuffer *buffer in part->syncBuffers) nvmtl_buffer_sync_in(buffer); // upstream #223: copy-backed inputs ahead too
         [self nvmtlMarkScheduled];
         if (!_legacyKernelStart) _legacyKernelStart = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1e9;
+        for (NVMTLSubmissionPart *dependency in _parts)
+            if (dependency->waitEvent) { part->commands.resource_key_count = 0; break; }
         const int r = nvmtl_vk_submit_begin(&part->commands, f);
         _nextSubmit++;
         if (r) {
@@ -426,12 +456,20 @@ static void nvmtl_gsub_ahead_pass1(void) {
         }
     }
 }
+- (BOOL)nvmtlPartReady {
+    if (!nvmtl_deferred_completion_on() || _executionDone || _cbError || _nextPart >= _parts.count) return YES;
+    NVMTLSubmissionPart *part = _parts[_nextPart];
+    // Errors go through finish, preserving its witness, timeout and quarantine.
+    return !part->inflight || nvmtl_vk_submit_ready(part->inflight) != 0;
+}
 - (BOOL)nvmtlAdvancePart {
     if (_executionDone) return NO;
     if (_cbError) { [self nvmtlFinishExecution:_cbError]; return YES; }
     if (_nextPart >= _parts.count) { [self nvmtlFinishExecution:nil]; return YES; }
     NVMTLSubmissionPart *part = _parts[_nextPart];
     const BOOL ahead = part->inflight || part->aheadFailed;
+    if (!ahead) for (NVMTLSubmissionPart *dependency in _parts)
+        if (dependency->waitEvent) { part->commands.resource_key_count = 0; break; }
     if (part->waitEvent && !ahead && !part->waitFolded) {
         if (![part->waitEvent respondsToSelector:@selector(signaledValue)]) {
             [self nvmtlFinishExecution:[NSError errorWithDomain:MTLCommandBufferErrorDomain code:MTLCommandBufferErrorInternal
@@ -455,9 +493,32 @@ static void nvmtl_gsub_ahead_pass1(void) {
         if (part->inflight) result = nvmtl_gsub_finish(part);
         else if (part->aheadFailed) result = part->aheadFailed;
         else {
-            nvmtl_prepare_submission_copies(part);
-            for (NVMTLBuffer *buffer in part->copyInputs) nvmtl_buffer_sync_in(buffer);
-            result = nvmtl_vk_submit_wait(&part->commands);
+            BOOL inputsReady = YES;
+            for (NSArray *input in part->surfaceInputs)
+                if (![(NVMTLTexture *)input[0] nvmtlRefreshAfterWait:[input[1] unsignedIntValue]]) inputsReady = NO;
+            part->hostBaselines = [NSMapTable strongToStrongObjectsMapTable];
+            for (NVMTLBuffer *buffer in part->syncBuffers) {
+                nvmtl_buffer_sync_in(buffer);
+                if (buffer->_hostPtr && buffer->_b.map && buffer->_hostLen) {
+                    NSData *baseline = [NSData dataWithBytes:buffer->_b.map length:buffer->_hostLen];
+                    if (baseline) [part->hostBaselines setObject:baseline forKey:buffer];
+                    else inputsReady = NO;
+                }
+            }
+            // Input copies are ready now. Submit without occupying the sole
+            // execution worker until the GPU completes; publication stays below.
+            if (inputsReady && !part->needsHostPublication && nvmtl_async_commit_on() && nvmtl_deferred_completion_on() && atomic_load(&gsub_inflight) < nvmtl_gsub_cap()) {
+                nvmtl_inflight *flight = nvmtl_vk_inflight_new();
+                if (flight) {
+                    result = nvmtl_vk_submit_begin(&part->commands, flight);
+                    if (!result) {
+                        part->inflight = flight;
+                        atomic_fetch_add(&gsub_inflight, 1);
+                        return YES;
+                    }
+                    nvmtl_vk_inflight_free(flight);
+                } else result = nvmtl_vk_submit_wait(&part->commands);
+            } else result = inputsReady ? nvmtl_vk_submit_wait(&part->commands) : -1;
         }
         if (result == -2) {
             if (!nvmtl_quarantined_parts) nvmtl_quarantined_parts = [NSMutableArray new];
@@ -466,8 +527,11 @@ static void nvmtl_gsub_ahead_pass1(void) {
         if (result == 0) [self nvmtlCollectDeviceTiming:&part->commands];
         BOOL published = result == 0;
         if (published) {
-            for (NVMTLTexture *texture in part->surfaces) if (![texture nvmtlSurfaceOut]) published = NO;
-            for (NVMTLBuffer *buffer in nvmtl_submission_copies(part->resources, YES)) nvmtl_buffer_sync_out(buffer);
+            if (!nvmtl_publish_surfaces(part->surfaces)) published = NO;
+            else nvmtl_pixel_replay_capture(part->surfaces);
+            for (NVMTLBuffer *buffer in part->syncBuffers)
+                if (!nvmtl_buffer_sync_out_baseline(buffer, [part->hostBaselines objectForKey:buffer])) published = NO;
+            part->hostBaselines = nil;
         }
         if (!published) {
             [self nvmtlFinishExecution:[NSError errorWithDomain:MTLCommandBufferErrorDomain code:MTLCommandBufferErrorInternal
@@ -556,6 +620,7 @@ static void nvmtl_pump_buffers(void) {
                     batch = [nvmtl_pending_buffers copy]; generation = nvmtl_pump_generation;
                 }
                 BOOL progress = NO;
+                NVMTLCommandBuffer *deferred = nil;
                 for (NVMTLCommandBuffer *cb in batch) {
                     BOOL eligible;
                     @synchronized ([NVMTLCommandBuffer class]) {
@@ -565,12 +630,26 @@ static void nvmtl_pump_buffers(void) {
                         eligible = reservations.firstObject == cb->_reservation;
                     }
                     if (!eligible) continue;
+                    if (![cb nvmtlPartReady]) { if (!deferred) deferred = cb; continue; }
                     if ([cb nvmtlAdvancePart]) progress = YES;
                     @synchronized ([NVMTLCommandBuffer class]) {
                         if (cb->_executionDone) {
                             [cb nvmtlReleaseReservation];
                             [nvmtl_pending_buffers removeObjectIdenticalTo:cb];
                             [cb nvmtlFinishCallbacks];
+                        }
+                    }
+                }
+                // Visit every eligible queue before blocking on the GPU. If all
+                // ready work is exhausted, retain the existing bounded fence wait
+                // instead of adding polling timers or a busy loop.
+                if (!progress && deferred) {
+                    if ([deferred nvmtlAdvancePart]) progress = YES;
+                    @synchronized ([NVMTLCommandBuffer class]) {
+                        if (deferred->_executionDone) {
+                            [deferred nvmtlReleaseReservation];
+                            [nvmtl_pending_buffers removeObjectIdenticalTo:deferred];
+                            [deferred nvmtlFinishCallbacks];
                         }
                     }
                 }

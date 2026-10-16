@@ -12,6 +12,7 @@ void nvlog(const char *fmt, ...);
 
 #import "NVMTLObjects.h"
 #import <objc/runtime.h>
+#include <mach/mach_vm.h>
 #import <objc/message.h>
 static int nvmtl_trace_on(void);
 static void nvtrace(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
@@ -47,7 +48,8 @@ static MTLDataType nvmtl_air_fc_type(NSString *t) {
 @class NVMTLBuffer;
 static void nvmtl_buffer_sync_in(NVMTLBuffer *b);
 @class NVMTLCommandBuffer;
-static void nvmtl_buffer_sync_out(NVMTLBuffer *b);
+static BOOL nvmtl_buffer_sync_out(NVMTLBuffer *b);
+static BOOL nvmtl_buffer_sync_out_baseline(NVMTLBuffer *b, NSData *baseline);
 static void nvbt(const char *tag, int *count, int max) {
     if (*count >= max) return; (*count)++;
     extern const char *nvmtl_log_path(void);
@@ -297,13 +299,16 @@ static void nvmtl_grave_put(const nvk_image *old) {
         nvlog("residency (res2): graveyard realloc FAILED - an old %llu MB backing is LEAKED, not freed in use", (unsigned long long)(old->alloc >> 20)); }
     os_unfair_lock_unlock(&gGraveLock);
 }
-static int gRes2On = -1; static uint64_t gRes2Cold, gRes2Hot, gRes2Margin;
+static int gRes2On = -1; static uint64_t gRes2Cold, gRes2Hot, gRes2Margin, gRes2PromoteBytes;
 static int nvmtl_res2_on(void) {
     if (gRes2On < 0) {
         const char *e = getenv("NVMTL_NO_RES2"), *c = getenv("NVMTL_RES2_COLD"), *h = getenv("NVMTL_RES2_HOT"), *m = getenv("NVMTL_RES2_MARGIN_MB");
         gRes2Cold = c && *c ? strtoull(c, NULL, 10) : 600;
         gRes2Hot = h && *h ? strtoull(h, NULL, 10) : 120;
         gRes2Margin = (m && *m ? strtoull(m, NULL, 10) : 256) << 20;
+        const char *pb = getenv("NVMTL_RES2_PROMOTE_MB");
+        uint64_t promoteMB = pb && *pb ? strtoull(pb, NULL, 10) : 256;
+        gRes2PromoteBytes = (promoteMB > 65536 ? 65536 : promoteMB) << 20;
         gRes2On = !(e && e[0] == '1');
         nvlog("residency (res2): LRU page-off/page-on %s (NVMTL_NO_RES2=%s) - cold %llu ticks, hot %llu ticks, margin %llu MB",
               gRes2On ? "ON" : "OFF", e ? e : "unset", (unsigned long long)gRes2Cold, (unsigned long long)gRes2Hot, (unsigned long long)(gRes2Margin >> 20));
@@ -507,9 +512,16 @@ static void nvmtl_res2_pass(void) {
     unsigned on = 0, off = 0, onB = 0, offB = 0, busy = 0, noroom = 0; uint64_t onM = 0, offM = 0;
     const uint64_t coldest = cold.count ? tick - *r2_last(cold[0]) : 0;
     NSUInteger ci = 0;
+    unsigned deferred = 0;
     for (id t in (want ? @[] : hot)) {
         if (__atomic_load_n(r2_refs(t), __ATOMIC_ACQUIRE)) { busy++; continue; }
         const uint64_t need = r2_alloc(t);
+        // Bound successful promotion traffic; permit one oversized resource so
+        // a large texture cannot starve forever. Zero disables this limit.
+        if (on && gRes2PromoteBytes &&
+            (onM >= gRes2PromoteBytes || need > gRes2PromoteBytes - onM)) {
+            deferred++; continue;
+        }
         if (!nvmtl_vk_vram_room(need)) {
             uint64_t pending = 0;
             while (ci < cold.count && pending < need + gRes2Margin) {
@@ -520,6 +532,11 @@ static void nvmtl_res2_pass(void) {
             }
             noroom++;
             continue;
+        }
+        // Returning to VRAM needs more slack than remaining there. A deferred
+        // promotion must not evict another resource just to satisfy this margin.
+        if (need > UINT64_MAX - gRes2Margin || !nvmtl_vk_vram_room(need + gRes2Margin)) {
+            deferred++; continue;
         }
         const uint64_t a = r2_alloc(t); const BOOL tb = !r2_tex(t);
         if (r2_move(t, 0) == 0) { on++; onB += tb; onM += a; __atomic_store_n(r2_want(t), 0, __ATOMIC_RELEASE); }
@@ -556,6 +573,9 @@ static void nvmtl_res2_pass(void) {
               (unsigned long long)s3[2], (unsigned long long)s3[4], (unsigned long long)s3[3], (unsigned long long)s3[5],
               (unsigned long long)s3[0], (unsigned long long)s3[1]);
     }
+    // Retry deferred promotions on a later ordinary pager wake, without
+    // scheduling a busy loop while the card remains near its watermark.
+    if (deferred) atomic_store(&gRes2Scan, 1);
     if (noroom) { atomic_store(&gRes2Scan, 1); if (off) nvmtl_res2_kick(1); }
     if (undrained) { if (!(on || off) && nvmtl_ep_room()) atomic_fetch_add(&gRes2Epoch, 1); atomic_store(&gRes2Scan, 1); }
 }
@@ -594,14 +614,19 @@ static void nvmtl_purge_report(const char *why) {
           (unsigned long long)nemp, (unsigned long long)(bemp >> 20),
           (unsigned long long)atomic_load(&gPurgeAsks), (unsigned long long)(bemp >> 20));
 }
-static void nvmtl_pre_release(void *held) { @autoreleasepool { (void)CFBridgingRelease(held); } }
+static void nvmtl_pre_release(void *held, int completed);
+static void nvmtl_managed_mark(NVMTLBuffer *b, NSUInteger lo, NSUInteger hi);
 static void nvmtl_managed_flush(void) {
     if (!atomic_load(&gManagedAny) || gManagedInFlush) return;
     gManagedInFlush = 1;
     NSMutableArray *todo = [NSMutableArray new];
     os_unfair_lock_lock(&gManagedLock);
     for (NVMTLBuffer *b in gManagedDirty.allObjects) {
-        if (b->_dirtyHi > b->_dirtyLo) [todo addObject:@[b, @(b->_dirtyLo), @(b->_dirtyHi)]];
+        if (b->_dirtyRangeCount) {
+            for (unsigned i = 0; i < b->_dirtyRangeCount; i++)
+                [todo addObject:@[b, @(b->_dirtyRanges[i].lo), @(b->_dirtyRanges[i].hi)]];
+        } else if (b->_dirtyHi > b->_dirtyLo) [todo addObject:@[b, @(b->_dirtyLo), @(b->_dirtyHi)]];
+        b->_dirtyRangeCount = 0;
         b->_dirtyLo = b->_dirtyHi = 0;
     }
     [gManagedDirty removeAllObjects]; atomic_store(&gManagedAny, 0);
@@ -609,22 +634,58 @@ static void nvmtl_managed_flush(void) {
     if (todo.count && nvmtl_vk_pre_open()) {
         for (NSArray *t in todo) {
             NVMTLBuffer *b = t[0]; NSUInteger lo = [t[1] unsignedIntegerValue], n = [t[2] unsignedIntegerValue] - lo;
-            if (nvmtl_vk_pre_copy(&b->_shadow, lo, &b->_b, lo, n))
-                nvlog("managed: upload of %lu bytes at %lu FAILED - the GPU keeps the old bytes", (unsigned long)n, (unsigned long)lo);
+            if (nvmtl_vk_pre_copy(&b->_shadow, lo, &b->_b, lo, n)) {
+                nvmtl_managed_mark(b, lo, lo + n);
+                nvlog("managed: upload of %lu bytes at %lu FAILED - retained for retry", (unsigned long)n, (unsigned long)lo);
+            }
         }
         nvmtl_pre_release_hook = nvmtl_pre_release;
         nvmtl_vk_pre_hold((__bridge_retained void *)todo);
     } else
     for (NSArray *t in todo) {
         NVMTLBuffer *b = t[0]; NSUInteger lo = [t[1] unsignedIntegerValue], n = [t[2] unsignedIntegerValue] - lo;
-        if (nvmtl_vk_copy_buffer(nvmtl_device_queue(), &b->_shadow, lo, &b->_b, lo, n))
-            nvlog("managed: upload of %lu bytes at %lu FAILED - the GPU keeps the old bytes", (unsigned long)n, (unsigned long)lo);
+        if (nvmtl_vk_copy_buffer(nvmtl_device_queue(), &b->_shadow, lo, &b->_b, lo, n)) {
+            nvmtl_vk_pre_fail();
+            nvmtl_managed_mark(b, lo, lo + n);
+            nvlog("managed: upload of %lu bytes at %lu FAILED - retained for retry", (unsigned long)n, (unsigned long)lo);
+        }
     }
     gManagedInFlush = 0;
 }
 static void nvmtl_presubmit(void);
 static void nvmtl_managed_mark(NVMTLBuffer *b, NSUInteger lo, NSUInteger hi) {
+    if (lo >= hi || hi > b->_b.size) return;
     os_unfair_lock_lock(&gManagedLock);
+    if (!b->_dirtyRanges) b->_dirtyRanges = calloc(NVMTL_DIRTY_RANGE_CAP, sizeof *b->_dirtyRanges);
+    if (b->_dirtyRanges) {
+        NVMTLDirtyRange ranges[NVMTL_DIRTY_RANGE_CAP + 1];
+        unsigned count = b->_dirtyRangeCount;
+        memcpy(ranges, b->_dirtyRanges, count * sizeof *ranges);
+        // Recover the conservative interval if an earlier allocation failed.
+        if (!count && b->_dirtyHi > b->_dirtyLo) ranges[count++] = (NVMTLDirtyRange){b->_dirtyLo, b->_dirtyHi};
+        ranges[count++] = (NVMTLDirtyRange){lo, hi};
+        for (unsigned i = 1; i < count; i++) {
+            NVMTLDirtyRange r = ranges[i]; unsigned j = i;
+            while (j && ranges[j - 1].lo > r.lo) { ranges[j] = ranges[j - 1]; j--; }
+            ranges[j] = r;
+        }
+        unsigned merged = 0;
+        for (unsigned i = 0; i < count; i++) {
+            if (merged && ranges[i].lo <= ranges[merged - 1].hi)
+                ranges[merged - 1].hi = MAX(ranges[merged - 1].hi, ranges[i].hi);
+            else ranges[merged++] = ranges[i];
+        }
+        // Keep bounded metadata; merge the smallest gap if all slots are used.
+        if (merged > NVMTL_DIRTY_RANGE_CAP) {
+            unsigned best = 0; NSUInteger gap = NSUIntegerMax;
+            for (unsigned i = 0; i + 1 < merged; i++)
+                if (ranges[i + 1].lo - ranges[i].hi < gap) { best = i; gap = ranges[i + 1].lo - ranges[i].hi; }
+            ranges[best].hi = ranges[best + 1].hi;
+            memmove(ranges + best + 1, ranges + best + 2, (merged - best - 2) * sizeof *ranges);
+            merged--;
+        }
+        memcpy(b->_dirtyRanges, ranges, merged * sizeof *ranges); b->_dirtyRangeCount = merged;
+    }
     if (!gManagedDirty) gManagedDirty = [NSHashTable weakObjectsHashTable];
     if (b->_dirtyHi <= b->_dirtyLo) { b->_dirtyLo = lo; b->_dirtyHi = hi; }
     else { b->_dirtyLo = MIN(b->_dirtyLo, lo); b->_dirtyHi = MAX(b->_dirtyHi, hi); }
@@ -671,6 +732,22 @@ static void nvmtl_zero_flush(void) {
                if (!k || (k >> 12) != ((k + n) >> 12)) nvmtl_zero_census(); }
     } else if (todo.count) nvlog("zero-fill: no command buffer for %lu Private clears - they hold what VRAM held", (unsigned long)todo.count);
     gZeroInFlush = 0;
+}
+static void nvmtl_pre_release(void *held, int completed) {
+    @autoreleasepool {
+        NSArray *items = CFBridgingRelease(held);
+        if (!completed) for (id item in items) {
+            if ([item isKindOfClass:[NSArray class]]) {
+                NSArray *range = item;
+                nvmtl_managed_mark(range[0], [range[1] unsignedIntegerValue], [range[2] unsignedIntegerValue]);
+            } else if ([item isKindOfClass:[NVMTLBuffer class]]) {
+                os_unfair_lock_lock(&gZeroLock);
+                if (!gZeroOwed) gZeroOwed = [NSHashTable weakObjectsHashTable];
+                [gZeroOwed addObject:item]; atomic_store(&gZeroAny, 1);
+                os_unfair_lock_unlock(&gZeroLock);
+            }
+        }
+    }
 }
 static void nvmtl_presubmit(void) { @autoreleasepool { nvmtl_zero_flush(); } @autoreleasepool { nvmtl_managed_flush(); } }
 static int nvmtl_mzero_on(void) {
@@ -763,7 +840,22 @@ static NVMTLTexture *nvmtl_texbuf_make(NVMTLBuffer *b, MTLTextureDescriptor *d, 
     id<MTLTexture> t = [self newTextureWithDescriptor:d offset:offset bytesPerRow:bpr];
     if (t || !d) return t;
     void *base = [self contents];
-    if (!base || d.textureType != MTLTextureType2D || offset + bpr * d.height > _b.size) {
+    // Only the texels of the final row must fit, not its trailing padding.
+    // Subtractions/division keep invalid offsets and dimensions from wrapping.
+    extern int nvmtl_pixfmt_public(MTLPixelFormat f, uint32_t *vk, uint32_t *bpp, int *a8);
+    uint32_t vkf = 0, bpp = 0, bw = 1, bh = 1, bb = 0; int a8 = 0;
+    BOOL fits = NO;
+    if (d.width && d.height && !nvmtl_pixfmt_public(d.pixelFormat, &vkf, &bpp, &a8)) {
+        if (!nvmtl_vk_format_block(vkf, &bw, &bh, &bb)) { bw = bh = 1; bb = bpp; }
+        const NSUInteger cols = (d.width - 1) / bw + 1;
+        const NSUInteger rows = (d.height - 1) / bh + 1;
+        if (bb && cols <= NSUIntegerMax / bb && offset <= _b.size) {
+            const NSUInteger rowBytes = cols * bb, available = _b.size - offset;
+            fits = bpr >= rowBytes && rowBytes <= available
+                && (rows - 1) <= (available - rowBytes) / bpr;
+        }
+    }
+    if (!base || d.textureType != MTLTextureType2D || !fits) {
         nvlog("newTiledTextureWithDescriptor: %lux%lu bpr %lu off %lu: no linear view and no CPU copy (buffer %lu B) -> nil",
               (unsigned long)d.width, (unsigned long)d.height, (unsigned long)bpr, (unsigned long)offset, (unsigned long)_b.size);
         return nil; }
@@ -853,6 +945,7 @@ void nvmtl_vk_buffer_retire(nvk_buffer *b);
     if (_b.buf && nvmtl_trace_on()) nvtrace("BUFFREE 0x%llx len %zu", (unsigned long long)nvmtl_vk_buffer_address(&_b), _b.size);
     for (uint32_t k = 0; k < _nbpk; k++) nvmtl_vk_image_destroy(&_bpk[k].img);
     free(_bpk); _bpk = NULL; _nbpk = 0;
+    free(_dirtyRanges); _dirtyRanges = NULL;
     nvmtl_vk_buffer_retire(&_b); if (_shadow.buf) nvmtl_vk_buffer_retire(&_shadow);
     if (_subHeap) { NVMTLHeap *h = _subHeap; NSUInteger c = _subCharge; _subHeap = nil; _subCharge = 0;
                     if (_subPlaced && c) { _subPlaced = NO; [h nvmtlGiveRange:_heapOffset length:c]; }
@@ -1018,6 +1111,13 @@ static void nvmtl_surface_in_for_cb(NVMTLCommandBuffer *cb, NVMTLTexture *t) {
     // overwrite that earlier GPU write. Queue order or the application's event supplies the dependency.
     if (nvmtl_surface_pending_write(cb, r)) return;
     [t nvmtlSurfaceIn];
+    [t nvmtlTraceStorage:"bind"];
+    if (cb && cb->_surfaceWaitSeen && r->_surf) {
+        if (!cb->_surfaceInputs) cb->_surfaceInputs = [NSMutableDictionary new];
+        NSValue *key = [NSValue valueWithPointer:(__bridge const void *)r];
+        if (!cb->_surfaceInputs[key]) cb->_surfaceInputs[key] = @[r, @(r->_i.layout)];
+        cb->_hostSyncRequired = YES; // the event must include CPU publication
+    }
 }
 static unsigned nvmtl_surf_id(NVMTLTexture *t) { NVMTLTexture *r = (t && t->_parent) ? t->_parent : t; return (r && r->_surf) ? (unsigned)IOSurfaceGetID(r->_surf) : 0u; }
 static int nvmtl_noseed(void) { static uint64_t next; static int on; uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
@@ -1086,9 +1186,42 @@ unsigned long long nvmtl_tex_objs_live(void) {
     return made > gone ? made - gone : 0;
 }
 unsigned long long nvmtl_tex_objs_released(void) { return nvmtl_tex_objs_gone; }
+// SURFDMA-r1 counters (see nvmtl_surfdma_buffer)
+static size_t g_surfdma_bytes;
+static uint64_t g_surfdma_in, g_surfdma_out, g_surfdma_fallback, g_surfdma_imports, g_surfdma_refused;
+@implementation NVMTLTextureStorage
+- (instancetype)init {
+    if ((self = [super init])) {
+        static uint64_t next = 1;
+        identity = __atomic_fetch_add(&next, 1, __ATOMIC_RELAXED);
+    }
+    return self;
+}
+@end
 @implementation NVMTLTexture
+- (instancetype)init {
+    if ((self = [super init])) _coherence = [NVMTLTextureStorage new];
+    return self;
+}
 + (instancetype)alloc { nvmtl_tex_objs_made++; return [super alloc]; }
 - (void)setResponsibleProcess:(int)pid { static int said; if (!said++) nvlog("setResponsibleProcess: pid %d on a texture - per-process attribution is not kept; nothing to set (said once)", pid); }
+- (void)nvmtlTraceStorage:(const char *)operation {
+    if (!nvmtl_trace_on()) return;
+    NVMTLTexture *r = _parent ? _parent : self;
+    NVMTLTextureStorage *state = r->_coherence;
+    nvtrace("STORAGE %llu %s image %p surface %u plane %lu seed %u/%u gen %u synced %d level %u+%lu uploads-seen 0x%llx mode %s",
+        (unsigned long long)state->identity, operation, [r nvi]->img,
+        r->_surf ? (unsigned)IOSurfaceGetID(r->_surf) : 0, (unsigned long)r->_plane,
+        state->surfaceSeed, r->_surf ? IOSurfaceGetSeed(r->_surf) : 0, state->surfaceGeneration,
+        state->surfaceSynced, _baseLevel, (unsigned long)self.mipmapLevelCount,
+        (unsigned long long)__atomic_load_n(&state->uploadsSeen, __ATOMIC_RELAXED),
+        r->_vramOn ? "shared-vram" : r->_backBuf ? "buffer-alias" : r->_surf ? "surface-copy" : "gpu-image");
+}
+- (void)didModifyData {
+    // Private SPI semantics are not established: observe the notification
+    // without importing CPU bytes over possibly newer GPU content.
+    [self nvmtlTraceStorage:"didModifyData-notification"];
+}
 - (unsigned long long)protectionOptions { return 0; }
 - (NSUInteger)allocatedSize { nvk_image *i = [self nvi]; if (i->alloc) return (NSUInteger)i->alloc;
     NSUInteger l = i->layers ? i->layers : 1, m = i->mips ? i->mips : 1, bpp = i->bpp ? i->bpp : 4, bw = i->bw ? i->bw : 1, bh = i->bh ? i->bh : 1, tot = 0;
@@ -1149,6 +1282,12 @@ void nvmtl_texture_desc_swizzle(NVMTLTexture *t, MTLTextureDescriptor *d) {
     if (!_parent) nvmtl_vk_image_destroy(&_i);
     if (_stTwin.img) nvmtl_vk_image_destroy(&_stTwin);
     if (!_parent && _vramOn) { nvmtl_vk_buffer_destroy(&_vramBuf); _vramOn = NO; }
+    if (_dmaBuf.buf) {
+        nvmtl_vk_buffer_destroy(&_dmaBuf);
+        __atomic_sub_fetch(&g_surfdma_bytes, _dmaLen, __ATOMIC_RELAXED);
+        if (_surf) CFRelease(_surf);
+        _dmaBase = NULL; _dmaLen = 0;
+    }
     if (_surfOwned && _surf) CFRelease(_surf);
     if (_subHeap) { NVMTLHeap *h = _subHeap; NSUInteger c = _subCharge; _subHeap = nil; _subCharge = 0;
                     if (_subPlaced && c) { _subPlaced = NO; [h nvmtlGiveRange:_heapOffset length:c]; }
@@ -1182,9 +1321,66 @@ void nvmtl_texture_desc_swizzle(NVMTLTexture *t, MTLTextureDescriptor *d) {
 // IOSurface locking wires memory and updates its seed; it does not serialize
 // this process's GPU readback and CPU import. Every wrapper of one plane must
 // use the same monitor, including wrappers of shared family VRAM.
+// ---- SURFDMA-r1 ------------------------------------------------------------------------------------------------
+// With NVMTL_NO_SURFACE_SHARE=1 every IOSurface texture is a private image, and surface-in/out moved the pixels with a
+// CPU memcpy into/out of a staging buffer plus a GPU copy (WindowServer spent most of its CPU there). The NVK host-
+// pointer import (RM OS descriptor, snooped) lets the GPU copy straight between the image and the surface's own
+// pages instead. The import is made once per surface (it pins the pages; the texture retains the surface while it
+// holds it) and capped in total; anything that cannot be imported, or any copy that fails, takes the old path.
+// NVMTL_NO_SURFACE_DMA=1 turns it off.
+#define NVMTL_SURFDMA_CAP ((size_t)768 << 20)
+static int nvmtl_surfdma_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("NVMTL_NO_SURFACE_DMA");
+        const size_t al = nvmtl_vk_host_import_align();
+        on = !(e && e[0] == '1') && al != 0;
+        nvlog("SURFDMA-r1: IOSurface copies %s (host import alignment %zu, NVMTL_NO_SURFACE_DMA=%s)",
+              on ? "by the GPU straight from/to the surface pages" : "through a CPU staging copy", al, e ?: "unset");
+    }
+    return on;
+}
+static nvk_buffer *nvmtl_surfdma_buffer(NVMTLTexture *r, void *planeBase, size_t row, size_t *offOut)
+{
+    if (!nvmtl_surfdma_on() || !r->_surf) return NULL;
+    void *base = IOSurfaceGetBaseAddress(r->_surf);
+    if (!r->_dmaTried) {
+        r->_dmaTried = YES;
+        // IOSurface memory is whole VM pages, so a byte size such as 7936 x 1080 is rounded up to the page the
+        // surface's own mapping already covers. A larger import alignment than the page size is not assumed.
+        const size_t al = nvmtl_vk_host_import_align(), pg = (size_t)getpagesize();
+        const size_t len = (IOSurfaceGetAllocSize(r->_surf) + pg - 1) & ~(pg - 1);
+        if (!base || !len || !al || al > pg || ((uintptr_t)base & (pg - 1))) {
+            __atomic_add_fetch(&g_surfdma_refused, 1, __ATOMIC_RELAXED); return NULL;
+        }
+        if (__atomic_add_fetch(&g_surfdma_bytes, len, __ATOMIC_RELAXED) > NVMTL_SURFDMA_CAP) {
+            __atomic_sub_fetch(&g_surfdma_bytes, len, __ATOMIC_RELAXED);
+            __atomic_add_fetch(&g_surfdma_refused, 1, __ATOMIC_RELAXED); return NULL;
+        }
+        if (nvmtl_vk_buffer_import_host(base, len, &r->_dmaBuf)) {
+            __atomic_sub_fetch(&g_surfdma_bytes, len, __ATOMIC_RELAXED);
+            memset(&r->_dmaBuf, 0, sizeof r->_dmaBuf);
+            __atomic_add_fetch(&g_surfdma_refused, 1, __ATOMIC_RELAXED); return NULL;
+        }
+        CFRetain(r->_surf); r->_dmaBase = base; r->_dmaLen = len;
+        const uint64_t n = __atomic_add_fetch(&g_surfdma_imports, 1, __ATOMIC_RELAXED);
+        if (n <= 4 || n % 1000 == 0) nvlog("SURFDMA-r1: surface %u imported (%zu KB, %zu KB held in all, import #%llu)",
+                                           (unsigned)IOSurfaceGetID(r->_surf), len >> 10, g_surfdma_bytes >> 10, (unsigned long long)n);
+    }
+    if (!r->_dmaBuf.buf || base != r->_dmaBase || (uint8_t *)planeBase < (uint8_t *)base) return NULL;
+    const size_t off = (size_t)((uint8_t *)planeBase - (uint8_t *)base);
+    if (off + row * (size_t)r->_i.h > r->_dmaLen) return NULL;
+    *offOut = off;
+    return &r->_dmaBuf;
+}
 static id nvmtl_surface_sync(NVMTLTexture *t) {
     static char key;
     static NSMapTable *monitors;
+    // Associated objects retain the monitor for the wrapper's lifetime. Most texture
+    // binds can avoid serializing all surfaces on the class-wide creation lock.
+    id existing = objc_getAssociatedObject(t, &key);
+    if (existing) return existing;
     @synchronized ([NVMTLTexture class]) {
         id monitor = objc_getAssociatedObject(t, &key);
         if (!monitor) {
@@ -1202,24 +1398,43 @@ static id nvmtl_surface_sync(NVMTLTexture *t) {
     if (!r->_surf) return;
     @synchronized (nvmtl_surface_sync(r)) {
     const uint32_t vgen = r->_vramOn ? 0 : nvmtl_vram_gen(r->_surf, r->_plane);
-    if (r->_surfSynced && IOSurfaceGetSeed(r->_surf) == r->_surfSeed && (r->_vramOn || vgen == r->_surfGen)) return;
+    if (r->_coherence->surfaceSynced && IOSurfaceGetSeed(r->_surf) == r->_coherence->surfaceSeed && (r->_vramOn || vgen == r->_coherence->surfaceGeneration)) return;
     if (![r nvmtlSurfaceCopyable]) return;
     { uint32_t now = IOSurfaceGetSeed(r->_surf);
       if (r->_vramOn && nvmtl_vram_tag_current(r->_surf, r->_plane, now)) {
-          r->_surfSeed = now; r->_surfSynced = YES; g_surfin_skip++;
+          r->_coherence->surfaceSeed = now; r->_coherence->surfaceSynced = YES; g_surfin_skip++;
           static unsigned ns; if (ns++ < 6 || ns % 2000 == 0) nvlog("item 7: surface-in SKIPPED (shared VRAM current at seed %u): %llu skipped, %llu copied", now, g_surfin_skip, g_surfin_copy);
           return; } }
     uint32_t seed = 0;
     if (IOSurfaceLock(r->_surf, kIOSurfaceLockReadOnly, &seed) != kIOReturnSuccess) { nvlog("G13 surface-in: IOSurfaceLock FAILED"); return; }
     void *base = IOSurfaceGetBaseAddressOfPlane(r->_surf, (uint32_t)r->_plane);
     size_t row = IOSurfaceGetBytesPerRowOfPlane(r->_surf, (uint32_t)r->_plane);
-    int rc = (base && row) ? nvmtl_vk_image_write(r->_q, &r->_i, base, row) : -1;
+    int rc = -1;
+    { size_t doff = 0; nvk_buffer *db = (base && row) ? nvmtl_surfdma_buffer(r, base, row, &doff) : NULL;
+      if (db && nvmtl_vk_image_write_buffer(r->_q, &r->_i, db, doff, row) == 0) { rc = 0; __atomic_add_fetch(&g_surfdma_in, 1, __ATOMIC_RELAXED); }
+      else { if (db) __atomic_add_fetch(&g_surfdma_fallback, 1, __ATOMIC_RELAXED);
+             rc = (base && row) ? nvmtl_vk_image_write(r->_q, &r->_i, base, row) : -1; } }
     if (!rc && r->_i.bpp == 4) { char tag[24]; snprintf(tag, sizeof tag, "in%u-", (unsigned)IOSurfaceGetID(r->_surf)); nvmtl_frame_dump(tag, base, row, r->_i.w, r->_i.h); }
     IOSurfaceUnlock(r->_surf, kIOSurfaceLockReadOnly, NULL);
     if (rc) { nvlog("G13 surface-in: upload FAILED (%ux%u) — retried at the next use", r->_i.w, r->_i.h); return; }
-    r->_surfSeed = seed; r->_surfSynced = YES; r->_surfGen = vgen;
+    r->_coherence->surfaceSeed = seed; r->_coherence->surfaceSynced = YES; r->_coherence->surfaceGeneration = vgen;
     g_surfin_copy++; if (r->_vramOn) nvmtl_vram_tag_set(r->_surf, r->_plane, seed);
     static unsigned n; if (n++ < 6 || n % 2000 == 0) nvlog("G13 surface-in #%u: %ux%u surface %p seed %u uploaded", n, r->_i.w, r->_i.h, (void *)r->_surf, seed);
+    }
+}
+- (BOOL)nvmtlRefreshAfterWait:(uint32_t)layout {
+    NVMTLTexture *r = _parent ? _parent : self;
+    if (!r->_surf) return YES;
+    @synchronized (nvmtl_surface_sync(r)) {
+        // Recording has already advanced this field to the consumer's final
+        // layout. Refresh from the layout at its first use, then put it back.
+        uint32_t recorded = r->_i.layout;
+        r->_i.layout = layout;
+        [r nvmtlSurfaceIn];
+        BOOL ok = r->_coherence->surfaceSynced && r->_coherence->surfaceSeed == IOSurfaceGetSeed(r->_surf);
+        if (ok) ok = nvmtl_vk_image_restore_layout(r->_q, &r->_i, layout) == 0;
+        r->_i.layout = recorded;
+        return ok;
     }
 }
 - (BOOL)nvmtlSurfaceOut {
@@ -1230,8 +1445,8 @@ static id nvmtl_surface_sync(NVMTLTexture *t) {
     uint32_t ds = r->_vramOn ? (uint32_t)nvmtl_vk_surface_dirty((uint32_t)IOSurfaceGetID(r->_surf), (uint32_t)r->_plane) : 0;
     if (r->_vramOn && ds == 0) {
         uint32_t seed = IOSurfaceGetSeed(r->_surf);
-        r->_surfSeed = seed; r->_surfSynced = YES;
-        r->_surfGen = nvmtl_vram_tag_bump(r->_surf, r->_plane, seed);
+        r->_coherence->surfaceSeed = seed; r->_coherence->surfaceSynced = YES;
+        r->_coherence->surfaceGeneration = nvmtl_vram_tag_bump(r->_surf, r->_plane, seed);
         static unsigned nd; if (nd++ < 6 || nd % 5000 == 0) nvlog("surface-out -> dirty, no copy (%ux%u surface %u seed %u, #%u)", r->_i.w, r->_i.h, (unsigned)IOSurfaceGetID(r->_surf), seed, nd);
         return YES;
     }
@@ -1240,7 +1455,11 @@ static id nvmtl_surface_sync(NVMTLTexture *t) {
     if (IOSurfaceLock(r->_surf, lockopt, NULL) != kIOReturnSuccess) { nvlog("G13 surface-out: IOSurfaceLock FAILED"); return NO; }
     void *base = IOSurfaceGetBaseAddressOfPlane(r->_surf, (uint32_t)r->_plane);
     size_t row = IOSurfaceGetBytesPerRowOfPlane(r->_surf, (uint32_t)r->_plane);
-    int rc = (base && row) ? nvmtl_vk_image_read(r->_q, &r->_i, base, row) : -1;
+    int rc = -1;
+    { size_t doff = 0; nvk_buffer *db = (base && row) ? nvmtl_surfdma_buffer(r, base, row, &doff) : NULL;
+      if (db && nvmtl_vk_image_read_buffer(r->_q, &r->_i, db, doff, row) == 0) { rc = 0; __atomic_add_fetch(&g_surfdma_out, 1, __ATOMIC_RELAXED); }
+      else { if (db) __atomic_add_fetch(&g_surfdma_fallback, 1, __ATOMIC_RELAXED);
+             rc = (base && row) ? nvmtl_vk_image_read(r->_q, &r->_i, base, row) : -1; } }
     // Dirty refused with NO_CACHE = the kernel no longer accepts this VRAM binding (re-wired
     // under BAR1 pressure). The readback above preserved the pixels in system memory; rebind to
     // the current allocation and push them there so dirtys and flips heal. Rate-limited: at most
@@ -1258,8 +1477,8 @@ static id nvmtl_surface_sync(NVMTLTexture *t) {
     if (!rc && r->_i.bpp == 4) { char tag[24]; snprintf(tag, sizeof tag, "out%u-", (unsigned)IOSurfaceGetID(r->_surf)); nvmtl_frame_dump(tag, base, row, r->_i.w, r->_i.h); }
     uint32_t seed = 0; IOReturn unlocked = IOSurfaceUnlock(r->_surf, lockopt, &seed); if (lockopt) seed = IOSurfaceGetSeed(r->_surf);
     if (rc || unlocked != kIOReturnSuccess) { nvlog("G13 surface-out: readback FAILED (%ux%u)", r->_i.w, r->_i.h); return NO; }
-    r->_surfSeed = seed; r->_surfSynced = YES;
-    r->_surfGen = r->_vramOn ? r->_surfGen : nvmtl_vram_gen(r->_surf, r->_plane);
+    r->_coherence->surfaceSeed = seed; r->_coherence->surfaceSynced = YES;
+    r->_coherence->surfaceGeneration = r->_vramOn ? r->_coherence->surfaceGeneration : nvmtl_vram_gen(r->_surf, r->_plane);
     if (r->_vramOn && !lockopt) nvmtl_vram_tag_set(r->_surf, r->_plane, seed);
     static unsigned n; if (n++ < 6 || n % 2000 == 0) nvlog("G13 surface-out #%u: %ux%u surface %p seed %u, %.2f ms", n, r->_i.w, r->_i.h,
         (void *)r->_surf, seed, (clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) - t0) / 1e6);
@@ -1413,7 +1632,11 @@ static id nvmtl_surface_sync(NVMTLTexture *t) {
     if (nvmtl_vk_image_write_region_level_layer(_q, [self nvi], (const uint8_t *)bytes, row, (uint32_t)region.origin.x, (uint32_t)region.origin.y,
                                                 (uint32_t)region.size.width, (uint32_t)region.size.height, (uint32_t)level + _baseLevel, _baseSlice))
         nvlog("replaceRegion: upload FAILED");
-    else [self nvmtlSurfaceOut];
+    else {
+        if (level + _baseLevel < 64) __atomic_fetch_or(&_coherence->uploadsSeen, 1ull << (level + _baseLevel), __ATOMIC_RELAXED);
+        [self nvmtlTraceStorage:"cpu-upload"];
+        [self nvmtlSurfaceOut];
+    }
 }
 - (void)replaceRegion:(MTLRegion)region mipmapLevel:(NSUInteger)level slice:(NSUInteger)slice
             withBytes:(const void *)bytes bytesPerRow:(NSUInteger)row bytesPerImage:(NSUInteger)img {
@@ -1432,12 +1655,16 @@ static id nvmtl_surface_sync(NVMTLTexture *t) {
         rc = nvmtl_vk_image_write_region_level_layer(_q, im, (const uint8_t *)bytes + zi * per, row, (uint32_t)region.origin.x, (uint32_t)region.origin.y,
                                                      (uint32_t)region.size.width, (uint32_t)region.size.height, (uint32_t)level + _baseLevel, (uint32_t)(vol ? region.origin.z + zi : slice + _baseSlice));
     if (rc) nvlog("replaceRegion:slice: upload FAILED");
-    else [self nvmtlSurfaceOut];
+    else {
+        if (level + _baseLevel < 64) __atomic_fetch_or(&_coherence->uploadsSeen, 1ull << (level + _baseLevel), __ATOMIC_RELAXED);
+        [self nvmtlTraceStorage:"cpu-upload"];
+        [self nvmtlSurfaceOut];
+    }
 }
 - (id<MTLTexture>)nvmtlViewWithFormat:(MTLPixelFormat)f levels:(NSRange)levels {
     if (!levels.length || levels.location >= self.mipmapLevelCount || levels.length > self.mipmapLevelCount - levels.location) return nil;
     NVMTLTexture *v = [NVMTLTexture new];
-    { NVMTLTexture *vp_ = _parent ? _parent : self; __atomic_fetch_add(&vp_->_nviews, 1, __ATOMIC_ACQ_REL); }  v->_parent = _parent ? _parent : self; v->_usage = [self usage];
+    { NVMTLTexture *vp_ = _parent ? _parent : self; __atomic_fetch_add(&vp_->_nviews, 1, __ATOMIC_ACQ_REL); }  v->_parent = _parent ? _parent : self; v->_coherence = v->_parent->_coherence; v->_usage = [self usage];
     v->_q = _q; v->_fmt = f; v->_surf = _surf; v->_plane = _plane;
     v->_mips = (uint32_t)levels.length;
     v->_viewParent = self; v->_relativeLevel = (uint32_t)levels.location;
@@ -1484,7 +1711,7 @@ static uint32_t nvmtl_tex_attach_vkfmt(NVMTLTexture *t, int *a8) {
     if (tt == MTLTextureType3D && [self nvi]->mtl_type == 7 && !slices.location) slices = NSMakeRange(0, 1);
     if (((tt == MTLTextureType1D || tt == MTLTextureType1DArray) && [self nvi]->mtl_type != (uint32_t)tt) || (tt == MTLTextureType2DMultisample && ([self nvi]->mtl_type != 4 && [self nvi]->mtl_type != 8)) || (tt == MTLTextureType2DMultisampleArray && [self nvi]->mtl_type != 8) || (([self nvi]->mtl_type == 4 || [self nvi]->mtl_type == 8) && tt != MTLTextureType2DMultisample && tt != MTLTextureType2DMultisampleArray) || (tt == MTLTextureType3D && [self nvi]->mtl_type != 7)) { nvlog("newTextureView: textureType %lu of a %u-typed texture — not carried", (unsigned long)tt, [self nvi]->mtl_type); return nil; }
     NVMTLTexture *v = [NVMTLTexture new];
-    { NVMTLTexture *vp_ = _parent ? _parent : self; __atomic_fetch_add(&vp_->_nviews, 1, __ATOMIC_ACQ_REL); }  v->_parent = _parent ? _parent : self; v->_usage = [self usage];  v->_q = _q; v->_fmt = f; v->_surf = _surf; v->_plane = _plane; v->_mips = (uint32_t)levels.length;
+    { NVMTLTexture *vp_ = _parent ? _parent : self; __atomic_fetch_add(&vp_->_nviews, 1, __ATOMIC_ACQ_REL); }  v->_parent = _parent ? _parent : self; v->_coherence = v->_parent->_coherence; v->_usage = [self usage];  v->_q = _q; v->_fmt = f; v->_surf = _surf; v->_plane = _plane; v->_mips = (uint32_t)levels.length;
     v->_viewParent = self; v->_relativeLevel = (uint32_t)levels.location; v->_relativeSlice = (uint32_t)slices.location;
     v->_viewType = (uint32_t)tt; v->_viewSlices = (uint32_t)slices.length;
     v->_baseSlice = _baseSlice + (uint32_t)slices.location; v->_baseLevel = _baseLevel + (uint32_t)levels.location;
@@ -1524,6 +1751,8 @@ static uint32_t nvmtl_tex_attach_vkfmt(NVMTLTexture *t, int *a8) {
     return v;
 }
 @end
+
+#import "NVMTLSurfaceBatch.m"
 
 NSArray<NSDictionary *> *nvmtl_argbuf_fields(NVMTLFunction *function, NSUInteger ownerBufferIndex);
 NSArray<NSDictionary *> *nvmtl_air_argbuf_layout(NVMTLFunction *fn, NSUInteger bufferIndex, NSUInteger *size, NSUInteger *align);
@@ -2571,6 +2800,18 @@ static void nvmtl_sample_counter(NVMTLCommandBuffer *cb, id sb, NSUInteger i, id
 }
 
 unsigned nvmtl_apps1_resolve_miss, nvmtl_apps1_resolve_extra, nvmtl_apps1_ds_resolve_miss;
+// Binding-time LOD clamps replace the descriptor clamps for this binding only.
+// Keep the original sampler immutable: it can be shared across encoders/stages.
+static id<MTLSamplerState> nvmtl_sampler_with_lod(id<MTLSamplerState> sampler, float lo, float hi) {
+    if (!sampler) return nil;
+    NVMTLSamplerState *s = (NVMTLSamplerState *)sampler;
+    if (s->_descriptor.lodMinClamp == lo && s->_descriptor.lodMaxClamp == hi) return sampler;
+    MTLSamplerDescriptor *d = [s->_descriptor copy];
+    if (!d) return nil;
+    d.lodMinClamp = lo; d.lodMaxClamp = hi;
+    return [sampler.device newSamplerStateWithDescriptor:d];
+}
+
 @implementation NVMTLRenderCommandEncoder
 - (NSUInteger)tileWidth { return 0; }
 - (NSUInteger)tileHeight { return 0; }
@@ -3306,20 +3547,10 @@ static NVMTLBuffer *nvmtl_bytes_ring(NVMTLCommandBuffer *cb, NSUInteger len, siz
     for (NSUInteger k = 0; k < r.length; k++) [self setFragmentSamplerState:ss[k] atIndex:r.location + k];
 }
 - (void)setFragmentSamplerState:(id<MTLSamplerState>)ss lodMinClamp:(float)lo lodMaxClamp:(float)hi atIndex:(NSUInteger)i {
-    [self setFragmentSamplerState:ss atIndex:i];
-    NSString *key=[@(i) stringValue];
-    if(_fragmentSamplers[key]) {
-        NSMutableDictionary *state=[_fragmentSamplers[key] mutableCopy];
-        state[@"lod_min_clamp"]=@(lo);state[@"lod_max_clamp"]=@(hi);_fragmentSamplers[key]=state;
-    }
+    [self setFragmentSamplerState:nvmtl_sampler_with_lod(ss, lo, hi) atIndex:i];
 }
 - (void)setVertexSamplerState:(id<MTLSamplerState>)ss lodMinClamp:(float)lo lodMaxClamp:(float)hi atIndex:(NSUInteger)i {
-    [self setVertexSamplerState:ss atIndex:i];
-    NSString *key=[@(i) stringValue];
-    if(_vertexSamplers[key]) {
-        NSMutableDictionary *state=[_vertexSamplers[key] mutableCopy];
-        state[@"lod_min_clamp"]=@(lo);state[@"lod_max_clamp"]=@(hi);_vertexSamplers[key]=state;
-    }
+    [self setVertexSamplerState:nvmtl_sampler_with_lod(ss, lo, hi) atIndex:i];
 }
 - (void)setFragmentSamplerStates:(const id<MTLSamplerState> __unsafe_unretained [])ss lodMinClamps:(const float *)lo lodMaxClamps:(const float *)hi withRange:(NSRange)r {
     for(NSUInteger k=0;k<r.length;k++) [self setFragmentSamplerState:ss[k] lodMinClamp:lo[k] lodMaxClamp:hi[k] atIndex:r.location+k];
@@ -4001,7 +4232,9 @@ static BOOL nvmtl_nvconv_ready(id<MTLDevice> dev) {
     if (on >= 0) return on;
     pthread_mutex_lock(&g_nvc_lk);
     if (on < 0) {
-        const char *e = getenv("NVMTL_NVCONV"); on = !(e && e[0] == '0');
+        // Shape-only verification with a tolerance does not establish equivalence
+        // for future inputs. Preserve Apple's convolution unless explicitly opted in.
+        const char *e = getenv("NVMTL_NVCONV"); on = e && strcmp(e, "1") == 0;
         if (on) {
             NSError *err = nil;
             dispatch_data_t dd = dispatch_data_create(nvconv_metallib, nvconv_metallib_len, NULL, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
@@ -4416,7 +4649,7 @@ static void nvmtl_zprobe_drain(void) {
     if (nvmtl_vk_bind_sampler(&_cb->_c, NVMTL_SET_VERTEX, (uint32_t)i, ns ? &ns->_s : NULL)) nvlog("compute setSamplerState: bind FAILED");
 }
 - (void)setSamplerState:(id<MTLSamplerState>)ss lodMinClamp:(float)lo lodMaxClamp:(float)hi atIndex:(NSUInteger)i {
-    [self setSamplerState:ss atIndex:i];
+    [self setSamplerState:nvmtl_sampler_with_lod(ss, lo, hi) atIndex:i];
 }
 - (void)setBuffers:(const id<MTLBuffer> __unsafe_unretained [])b offsets:(const NSUInteger *)offs withRange:(NSRange)r {
     for (NSUInteger k = 0; k < r.length; k++) if (b[k]) [self setBuffer:b[k] offset:offs ? offs[k] : 0 atIndex:r.location + k];
@@ -5504,15 +5737,52 @@ static void nvmtl_buffer_sync_in(NVMTLBuffer *b)
     nvmtl_perf_note(NVP_SYNCIN, t0, b->_hostLen);
 }
 
-static void nvmtl_buffer_sync_out(NVMTLBuffer *b)
+static BOOL nvmtl_buffer_sync_out(NVMTLBuffer *b)
+{ return nvmtl_buffer_sync_out_baseline(b, nil); }
+
+static BOOL nvmtl_buffer_sync_out_baseline(NVMTLBuffer *b, NSData *baseline)
 {
     if (b && b->_shadow.map) {
         if (b->_syncOut) { b->_syncOut = 0; __atomic_store_n(&b->_zshadow, 0, __ATOMIC_RELEASE);
-            if (nvmtl_vk_copy_buffer(nvmtl_device_queue(), &b->_b, 0, &b->_shadow, 0, b->_b.size)) nvlog("commit: managed sync-out of %zu bytes FAILED", b->_b.size); }
-        return;
+            if (nvmtl_vk_copy_buffer(nvmtl_device_queue(), &b->_b, 0, &b->_shadow, 0, b->_b.size)) {
+                nvlog("commit: managed sync-out of %zu bytes FAILED", b->_b.size); return NO;
+            }
+        }
+        return YES;
     }
-    if (!b || !b->_hostPtr || !b->_b.map || !b->_hostLen) return;
+    if (!b || !b->_hostPtr || !b->_b.map || !b->_hostLen) return YES;
+    // ImageIO/CoreAnimation can wrap read-only pages as input. Retaining that
+    // buffer for synchronization does not imply the GPU wrote it. Never write
+    // unchanged bytes back, and let Mach enforce destination protection for
+    // actual changes instead of crashing WindowServer in memcpy.
     const uint64_t t0 = nvmtl_perf_now();
-    memcpy(b->_hostPtr, b->_b.map, b->_hostLen);
+    const uint8_t *before = baseline.length == b->_hostLen ? baseline.bytes : NULL;
+    const size_t chunk = before ? 4096 : 1u << 20;
+    for (size_t off = 0; off < b->_hostLen;) {
+        size_t n = MIN(chunk, b->_hostLen - off);
+        void *dst = (char *)b->_hostPtr + off;
+        const void *src = (char *)b->_b.map + off;
+        // Compare with the submitted input, not a host pointer that may now
+        // contain newer CPU data. Unchanged GPU blocks need no publication.
+        if (before && !memcmp(before + off, src, n)) { off += n; continue; }
+        if (before) {
+            size_t first = 0;
+            while (first < n && before[off + first] == ((const uint8_t *)src)[first]) first++;
+            size_t end = first;
+            while (end < n && before[off + end] != ((const uint8_t *)src)[end]) end++;
+            off += first; n = end - first;
+            dst = (char *)b->_hostPtr + off; src = (char *)b->_b.map + off;
+        }
+        if (memcmp(dst, src, n)) {
+            kern_return_t kr = mach_vm_write(mach_task_self(), (mach_vm_address_t)(uintptr_t)dst,
+                                             (vm_offset_t)(uintptr_t)src, (mach_msg_type_number_t)n);
+            if (kr != KERN_SUCCESS) {
+                nvlog("commit: host copy-back refused (%zu bytes at offset %zu, Mach %d)", n, off, kr);
+                return NO;
+            }
+        }
+        off += n;
+    }
     nvmtl_perf_note(NVP_SYNCOUT, t0, b->_hostLen);
+    return YES;
 }

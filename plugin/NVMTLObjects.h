@@ -15,12 +15,25 @@ static inline NSMutableData *nvmtl_fc_storage(NSUInteger count) {
     if (!count || count > NSUIntegerMax / stride) return nil;
     return [NSMutableData dataWithLength:count * stride];
 }
+// One coherence record per GPU image backing, shared by all of its views.
+// Separate copies of an IOSurface deliberately keep separate records.
+@interface NVMTLTextureStorage : NSObject {
+@public
+    uint64_t identity;
+    uint64_t uploadsSeen;
+    uint32_t surfaceSeed, surfaceGeneration;
+    BOOL surfaceSynced;
+}
+@end
+typedef struct { NSUInteger lo, hi; } NVMTLDirtyRange;
+#define NVMTL_DIRTY_RANGE_CAP 8
 @class NVMTLHeap;
 @interface NVMTLBuffer : NSObject <MTLBuffer> { @public nvk_buffer _b; MTLStorageMode _storage; NVMTLHeap *_heap; NSUInteger _heapOffset;
     void *_hostPtr; size_t _hostLen; id _hostDealloc;
     NVMTLHeap *_subHeap; NSUInteger _subCharge; BOOL _aliased;
     nvk_buffer _shadow; int _syncOut; int _zshadow;
-    NSUInteger _dirtyLo, _dirtyHi; } @end
+    NSUInteger _dirtyLo, _dirtyHi;
+    NVMTLDirtyRange *_dirtyRanges; unsigned _dirtyRangeCount; } @end
 #include <sched.h>
 static inline void nvmtl_buf_settle(NVMTLBuffer *b) {
     if (!__atomic_load_n(&b->_zshadow, __ATOMIC_ACQUIRE)) return;
@@ -43,8 +56,9 @@ static inline void *nvmtl_buf_cpu(NVMTLBuffer *b) { nvmtl_buf_settle(b); return 
   NVMTLTexture *_viewParent;
   uint32_t _viewType, _viewSlices, _relativeLevel, _relativeSlice;
   uint32_t _baseSlice, _baseLevel;
-  uint32_t _surfSeed, _surfGen; BOOL _surfSynced, _surfOwned;
+  BOOL _surfOwned;
   uint64_t _reimportTime;
+  NVMTLTextureStorage *_coherence;
   nvk_buffer _vramBuf; BOOL _vramOn;
   BOOL _stex;
   uint64_t _resid;
@@ -54,9 +68,11 @@ static inline void *nvmtl_buf_cpu(NVMTLBuffer *b) { nvmtl_buf_settle(b); return 
 - (nvk_image *)nvi;
 - (void *)nvview;
 - (void *)nvsampleview;
+- (void)nvmtlTraceStorage:(const char *)operation;
 - (void)nvmtlSurfaceIn;
 - (BOOL)nvmtlSurfaceOut;
 - (BOOL)nvmtlReimportVRAM;
+- (BOOL)nvmtlRefreshAfterWait:(uint32_t)layout;
 @end
 @interface NVMTLFunction : NSObject <MTLFunction> { @public NSData *_spirv; NSString *_fname; NSString *_stage; NSString *_air; NSDictionary *_fc; NSArray *_embedded; unsigned char _bcHash[32]; BOOL _bcHashed;
   NSDictionary *_refl; NSDictionary *_airNames; NSArray *_arguments;
@@ -112,13 +128,14 @@ extern id gNVMTLMainDevice;
 @interface NVMTLCommandBuffer : NSObject <MTLCommandBuffer> {
   NSError *_cbError;
   NSMutableDictionary *_userDictionary;
-  @public nvk_cmdbuf _c; NVMTLCommandQueue *_queue; BOOL _committed; BOOL _capacityHeld; MTLCommandBufferStatus _cbstatus;
+  @public nvk_cmdbuf _c; NVMTLCommandQueue *_queue; BOOL _committed; BOOL _hostSyncRequired; BOOL _capacityHeld; MTLCommandBufferStatus _cbstatus;
   NVMTLTexture *_present;
   NSMutableArray *_presentations;
   NSMutableArray *_handlers;
   NSMutableArray *_scratch;
   NSMutableSet *_resources;
   NSMutableSet *_surfDirty;
+  NSMutableDictionary *_surfaceInputs; BOOL _surfaceWaitSeen;
   NSMutableSet *_surfOverwrites; // contents defined by writes recorded in this command buffer
   unsigned _nEnc, _nEnd, _nHandlers, _nStatus, _nEnqueue, _nLabel, _nPresent, _nWait;
   unsigned _nEncSealed;
@@ -148,7 +165,7 @@ extern id gNVMTLMainDevice;
 @end
 @interface NVMTLDepthStencilState : NSObject <MTLDepthStencilState> { @public int _write; int _compare;
   int _stencil; uint32_t _sf[6], _sb[6]; } @end
-@interface NVMTLSamplerState : NSObject <MTLSamplerState> { @public nvk_sampler _s; NSDictionary *_pixelState; uint64_t _resid; } @end
+@interface NVMTLSamplerState : NSObject <MTLSamplerState> { @public nvk_sampler _s; NSDictionary *_pixelState; MTLSamplerDescriptor *_descriptor; uint64_t _resid; } @end
 @interface NVMTLFence : NSObject <MTLFence> { @public id<MTLDevice> _dev; NSString *_label; } @end
 @interface NVMTLResidencySet : NSObject <MTLResidencySet> { @public id<MTLDevice> _dev; NSString *_label; NSMutableArray *_allocs; } @end
 @interface NVMTLEvent : NSObject <MTLEvent> { @public id<MTLDevice> _dev; NSString *_label; uint64_t _value; NSCondition *_condition; } @end
@@ -283,6 +300,8 @@ typedef struct { nvk_image img; uint32_t key[12]; NSUInteger off, len; } nvmtl_p
 @interface NVMTLHeap () { @public nvmtl_park_t *_pk; uint32_t _npk; } @end
 @interface NVMTLBuffer () { @public nvmtl_park_t *_bpk; uint32_t _nbpk; os_unfair_lock _bpl; } @end
 @interface NVMTLTexture () { @public BOOL _bparkable; } @end
+// SURFDMA-r1: this IOSurface's pages imported as a GPU buffer (root texture only; retains the surface while held)
+@interface NVMTLTexture () { @public nvk_buffer _dmaBuf; void *_dmaBase; size_t _dmaLen; BOOL _dmaTried; } @end
 static void nvmtl_heap_park(NVMTLHeap *h, nvk_image *img, const uint32_t *key, NSUInteger off, NSUInteger len);
 void nvmtl_heap_back(NVMTLHeap *h, NSUInteger size, int shared);
 @interface NVMTLIndirectCommandBuffer () { @public uint32_t _purge; } @end

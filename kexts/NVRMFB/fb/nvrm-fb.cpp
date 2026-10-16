@@ -51,6 +51,7 @@ extern "C" {
 }
 #include <libkern/OSAtomic.h>
 #include "nvrm_vram_abi.h"
+#include "../../NVRM/nvrm_present_diag.h"
 
 // Surfaces may use half of a resizable BAR1 (>= 4 GB) and three quarters of a smaller one. WAS: a fixed 192 MB below
 // 4 GB, which is 3/4 of the 256 MB firmware window but left a 512 MB or 1 GB BAR1 no better off (issue #27).
@@ -102,6 +103,7 @@ static void nvrmEdidPanelSizeMm(const NvU8 *edid, NvU16 size, NvU16 *mmW, NvU16 
 }
 
 typedef NvU64 (*nvrm_phys_for_va_t)(const void *va);
+static volatile SInt64 gFlipVblEvents; // FLIPVBL-r1: primary FLIP_OCCURRED events (all heads)
 #include <mach/kmod.h>
 extern "C" kern_return_t _start(kmod_info_t *ki, void *d); extern "C" kern_return_t _stop(kmod_info_t *ki, void *d);
 extern "C" { KMOD_EXPLICIT_DECL(com.nullmoth.NVRMFB, "0.1", _start, _stop) }
@@ -303,6 +305,9 @@ class NVRMNVDAFramebuffer : public IOFramebuffer {
     struct NvKmsKapiVblankIntrCallback *fHwVblCb = nullptr;
     thread_call_t fHwVblCall = nullptr;
     volatile uint64_t fHwVblLast = 0;
+    volatile SInt64 fPresentVblSequence = 0;
+    volatile SInt64 fPresentTimerSequence = 0;
+    volatile uint64_t fPresentTimerLast = 0;
     volatile unsigned long long fHwVblCalls = 0;
     unsigned fModeSetTicks = 0;
     bool fHwVblWanted = false;
@@ -317,6 +322,10 @@ class NVRMNVDAFramebuffer : public IOFramebuffer {
     unsigned    fFlipCacheN = 0, fFlipCount = 0, fFlipRejects = 0, fFlipEvict = 0;
     struct NvKmsKapiSurface *fFrontSurf = nullptr;
     static inline volatile SInt32 sFlipLatched[8] = {};
+    // FLIPVBL-r1: uptime of the last primary-layer FLIP_OCCURRED per head (the completion notifier the display engine
+    // writes when a flip latches at vblank). Plain per-head values, never a framebuffer pointer: the event can arrive
+    // while a framebuffer is being torn down.
+    static inline volatile uint64_t sFlipVblLast[8] = {};
     bool flipToMemory(struct NvKmsKapiMemory *mem, unsigned w, unsigned h, unsigned pitch, int *rcOut, bool pure = false, UInt64 cookie = 0);
     bool fSubmissionSeen = false, fSubmissionFaulted = false;
     unsigned fRejected = 0;     // commits NVKMS refused on this head, for NVRMRejectedCommits
@@ -363,7 +372,12 @@ class NVRMNVDAFramebuffer : public IOFramebuffer {
             FBLOG("kapi event type %d (display change)", (int)event->type);
         if (event->type == NVKMS_EVENT_TYPE_FLIP_OCCURRED && event->u.flipOccurred.head < 8
             && event->u.flipOccurred.layer == NVKMS_KAPI_LAYER_PRIMARY_IDX)
+        {
             OSIncrementAtomic(&sFlipLatched[event->u.flipOccurred.head]);
+            uint64_t now = 0; clock_get_uptime(&now);
+            sFlipVblLast[event->u.flipOccurred.head] = now;
+            OSAddAtomic64(1, &gFlipVblEvents);
+        }
         // A display connected (or a connector changed) after boot: look for it off this context, after a short
         // settle (EDID reads follow the hot-plug interrupt).
         if (event->type == NVKMS_EVENT_TYPE_DPY_CHANGED || event->type == NVKMS_EVENT_TYPE_DYNAMIC_DPY_CONNECTED)
@@ -1716,6 +1730,18 @@ void NVRMNVDAFramebuffer::barsFire(thread_call_param_t p0, thread_call_param_t)
     uint64_t deadline; clock_interval_to_deadline(gap, kMillisecondScale, &deadline);
     me->scheduleCall(me->fBars, deadline);
 }
+// FLIPVBL-r1: NVKMS cannot give Turing a vblank interrupt callback (its RG-semaphore path is Ampere+), so the VBL
+// macOS sees is this timer. Every flip that latches is a real vblank though: while flips arrive (DBFLIP-r1 flips every
+// presented frame), the timer's next tick is put on the grid of the last latch (latch + k * period), so VBL follows the
+// panel's real scan-out instead of a free-running clock. With no flip for 1 s the timer free-runs from its last phase.
+static int gFlipVbl = 1;
+static SInt64 gFlipVblTicks, gFlipVblErrUsSum, gFlipVblLastErrUs, gFlipVblResync;
+SYSCTL_INT(_debug, OID_AUTO, nvrmfb_flipvbl, CTLFLAG_RW | CTLFLAG_LOCKED, &gFlipVbl, 0, "FLIPVBL-r1: 1 = lock the VBL timer's phase to flip latches (default), 0 = free-running timer");
+SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_flipvbl_events, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gFlipVblEvents, "FLIPVBL-r1: primary FLIP_OCCURRED events seen");
+SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_flipvbl_ticks, CTLFLAG_RD | CTLFLAG_LOCKED, &gFlipVblTicks, "FLIPVBL-r1: VBL ticks scheduled on the latch grid");
+SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_flipvbl_err_us_sum, CTLFLAG_RD | CTLFLAG_LOCKED, &gFlipVblErrUsSum, "FLIPVBL-r1: sum of |tick - latch grid| in us (divide by ticks)");
+SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_flipvbl_last_err_us, CTLFLAG_RD | CTLFLAG_LOCKED, &gFlipVblLastErrUs, "FLIPVBL-r1: last |tick - latch grid| in us");
+SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_flipvbl_resync, CTLFLAG_RD | CTLFLAG_LOCKED, &gFlipVblResync, "FLIPVBL-r1: ticks pushed one period to avoid two VBLs within a quarter period");
 uint64_t NVRMNVDAFramebuffer::vblPeriodAbs()
 {
     const struct NvKmsKapiDisplayModeTimings &t = fMode.timings;
@@ -1734,7 +1760,9 @@ uint64_t NVRMNVDAFramebuffer::vblPeriodAbs()
 void NVRMNVDAFramebuffer::hwVblIntr(NvU64 param, NvU64)
 {
     NVRMNVDAFramebuffer *me = (NVRMNVDAFramebuffer *)(uintptr_t)param;
+    OSAddAtomic64(1, &me->fPresentVblSequence);
     uint64_t now = 0; clock_get_uptime(&now); me->fHwVblLast = now;
+    OSAddAtomic64(1, &me->fPresentVblSequence);
     me->scheduleCall(me->fHwVblCall, 0);
 }
 void NVRMNVDAFramebuffer::hwVblDeliver(thread_call_param_t p0, thread_call_param_t)
@@ -1767,13 +1795,30 @@ void NVRMNVDAFramebuffer::vblFire(thread_call_param_t p0, thread_call_param_t)
     }
     {   uint64_t nowv = 0; clock_get_uptime(&nowv); const uint64_t per = me->vblPeriodAbs();
         const bool hwLive = me->fHwVblLast && nowv - me->fHwVblLast < 2 * per;
-        if (!hwLive && me->fVbl.proc) { me->fVbl.proc(me->fVbl.target, me->fVbl.ref); me->fVblCalls++; } }
+        if (!hwLive && me->fVbl.proc) {
+            OSAddAtomic64(1, &me->fPresentTimerSequence); me->fPresentTimerLast = nowv;
+            OSAddAtomic64(1, &me->fPresentTimerSequence);
+            me->fVbl.proc(me->fVbl.target, me->fVbl.ref); me->fVblCalls++;
+        } }
     uint64_t period = 0, now = 0;
     period = me->vblPeriodAbs();
     clock_get_uptime(&now);
     if (me->fVblNext == 0) me->fVblNext = now;
     me->fVblNext += period;
     if (me->fVblNext <= now) me->fVblNext = now + period;
+    if (me->fHead < 8 && period) {
+        const uint64_t last = sFlipVblLast[me->fHead];
+        uint64_t window = 0; nanoseconds_to_absolutetime(1000000000ull, &window);
+        if (gFlipVbl && last && now >= last && now - last < window) {
+            uint64_t aligned = last + ((now - last) / period + 1) * period;
+            if (aligned - now < period / 4) { aligned += period; OSAddAtomic64(1, &gFlipVblResync); }
+            uint64_t off = (now - last) % period; if (off > period / 2) off = period - off;
+            uint64_t offNs = 0; absolutetime_to_nanoseconds(off, &offNs);
+            gFlipVblLastErrUs = (SInt64)(offNs / 1000); OSAddAtomic64((SInt64)(offNs / 1000), &gFlipVblErrUsSum);
+            OSAddAtomic64(1, &gFlipVblTicks);
+            me->fVblNext = aligned;
+        }
+    }
     me->scheduleCall(me->fVblTimer, me->fVblNext);
 }
 bool NVRMNVDAFramebuffer::setHeadActive(bool active)
@@ -2580,6 +2625,10 @@ static inline SInt64 nvrmParkCeiling(NvU64 barLen)
 static struct { struct NvKmsKapiMemory *m; void *k; NvU64 n; } gParkedForever[64];
 static int      gNParkedForever   = 0;
 static volatile SInt64 gVramParkedBytes = 0;
+static volatile SInt64 gVramOverlapRejects = 0;
+static unsigned gVramParkLogs = 0;
+SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_vram_parked_bytes, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gVramParkedBytes, "BAR1 bytes pinned to protect console/scanout");
+SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_vram_overlap_rejects, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gVramOverlapRejects, "allocations rejected for console/scanout overlap");
 static volatile SInt64 gCntGrant, gCntGrantBytes, gCntRelease, gCntReleaseBytes;
 SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_vram_grants,        CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gCntGrant,        "vramGrant successes");
 SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_vram_grant_bytes,   CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gCntGrantBytes,   "bytes granted");
@@ -2631,6 +2680,8 @@ static bool gFbSysctl = false;
 static void nvrmfbInstallSysctl(void)
 {
     if (gFbSysctl) return; gFbSysctl = true;
+    sysctl_register_oid(&sysctl__debug_nvrmfb_vram_parked_bytes);
+    sysctl_register_oid(&sysctl__debug_nvrmfb_vram_overlap_rejects);
     sysctl_register_oid(&sysctl__debug_nvrmfb_vram_grants);   sysctl_register_oid(&sysctl__debug_nvrmfb_vram_grant_bytes);
     sysctl_register_oid(&sysctl__debug_nvrmfb_vram_releases); sysctl_register_oid(&sysctl__debug_nvrmfb_vram_release_bytes);
     sysctl_register_oid(&sysctl__debug_nvrmfb_vram_mapped_bytes); sysctl_register_oid(&sysctl__debug_nvrmfb_vram_budget_bytes);
@@ -2641,6 +2692,9 @@ static void nvrmfbInstallSysctl(void)
     sysctl_register_oid(&sysctl__debug_nvrmfb_flip_lean);
     sysctl_register_oid(&sysctl__debug_nvrmfb_flip_latch); sysctl_register_oid(&sysctl__debug_nvrmfb_flip_latch_waits);
     sysctl_register_oid(&sysctl__debug_nvrmfb_flip_latch_timeouts); sysctl_register_oid(&sysctl__debug_nvrmfb_flip_latch_max_us);
+    sysctl_register_oid(&sysctl__debug_nvrmfb_flipvbl); sysctl_register_oid(&sysctl__debug_nvrmfb_flipvbl_events);
+    sysctl_register_oid(&sysctl__debug_nvrmfb_flipvbl_ticks); sysctl_register_oid(&sysctl__debug_nvrmfb_flipvbl_err_us_sum);
+    sysctl_register_oid(&sysctl__debug_nvrmfb_flipvbl_last_err_us); sysctl_register_oid(&sysctl__debug_nvrmfb_flipvbl_resync);
 }
 
 bool NVRMNVDAFramebuffer::vramGrant(struct NVRMVramRequest *r)
@@ -2649,6 +2703,7 @@ bool NVRMNVDAFramebuffer::vramGrant(struct NVRMVramRequest *r)
     nvrmfbInstallSysctl();
     r->phys = 0; r->kva = nullptr; r->handle = nullptr; r->actualSize = 0; r->mappedTotal = 0;
     if (!fKms || !fDev) { FBLOG("nvAllocVram: no NVKMS device yet"); return false; }
+    if (r->size > (~0ull - 0xFFFFull)) return false;
     NvU64 want = (r->size + 0xFFFFull) & ~0xFFFFull;
     if (!want) return false;
 
@@ -2713,6 +2768,7 @@ bool NVRMNVDAFramebuffer::vramGrant(struct NVRMVramRequest *r)
                 gParkedForever[gNParkedForever].n = want;
                 gNParkedForever++;
                 OSAddAtomic64((SInt64)want, &gVramParkedBytes);
+                FBLOG("BAR1FIX-r1: pinned slot=%d phys=0x%llx bytes=%llu total=%lld", gNParkedForever, p, want, (long long)gVramParkedBytes);
             } else {
                 fKms->unmapMemory(fDev, m, NVKMS_KAPI_MAPPING_TYPE_KERNEL, k); fKms->freeMemory(fDev, m);
                 // A surface larger than the park ceiling (a 3840x2560 desktop is 37.5 MB, the ceiling on a 256 MB BAR1
@@ -2809,6 +2865,30 @@ bool NVRMNVDAFramebuffer::vramRelease(struct NVRMVramRequest *r)
 IOReturn NVRMNVDAFramebuffer::callPlatformFunction(const OSSymbol *functionName, bool waitForFunction,
                                                void *param1, void *param2, void *param3, void *param4)
 {
+    if (functionName && functionName->isEqualTo(NVRM_PRESENT_TIMING_FN)) {
+        NVRMPresentTiming *r = (NVRMPresentTiming *)param1;
+        if (!r || r->version != NVRM_PRESENT_DIAG_VERSION) return kIOReturnBadArgument;
+        // No allocation, NVKMS operation, wait or display-state mutation on this path.
+        uint64_t now = 0; clock_get_uptime(&now);
+        const uint64_t period = vblPeriodAbs(); uint64_t last = 0, timer = 0, seq = 0, ts = 0;
+        bool coherent = false, timerCoherent = false;
+        for (unsigned i = 0; i < 3; ++i) {
+            seq = (uint64_t)OSAddAtomic64(0, &fPresentVblSequence); last = fHwVblLast;
+            if (!(seq & 1) && seq == (uint64_t)OSAddAtomic64(0, &fPresentVblSequence)) { coherent = true; break; }
+        }
+        for (unsigned i = 0; i < 3; ++i) {
+            ts = (uint64_t)OSAddAtomic64(0, &fPresentTimerSequence); timer = fPresentTimerLast;
+            if (!(ts & 1) && ts == (uint64_t)OSAddAtomic64(0, &fPresentTimerSequence)) { timerCoherent = true; break; }
+        }
+        uint64_t lastNs = 0, periodNs = 0, timerNs = 0;
+        absolutetime_to_nanoseconds(last, &lastNs); absolutetime_to_nanoseconds(period, &periodNs);
+        absolutetime_to_nanoseconds(timer, &timerNs);
+        r->lastVblankNs = lastNs; r->periodNs = periodNs; r->vblankSequence = seq / 2;
+        r->hardwareLive = coherent && last && now >= last && now - last < 2 * period;
+        r->modeEpoch = fModeSwitches;
+        r->lastTimerVblankNs = timerCoherent ? timerNs : 0; r->timerVblankSequence = ts / 2;
+        return kIOReturnSuccess;
+    }
     bool isAlloc = functionName && functionName->isEqualTo(NVRM_VRAM_FN_ALLOC);
     bool isFree  = functionName && functionName->isEqualTo(NVRM_VRAM_FN_FREE);
     if (functionName && functionName->isEqualTo("NVRMGpuPower")) {   // from NVRM: 0 standby, 1 resumed, 2 lost
